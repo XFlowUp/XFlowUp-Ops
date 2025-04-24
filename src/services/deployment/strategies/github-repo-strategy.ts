@@ -12,6 +12,7 @@ export class GithubRepoStrategy implements DeploymentStrategy {
   private ecsService: ECSService;
   private ecrService: ECRService;
   private dockerfileGenerator: DockerfileGenerator;
+  private lastPublicEndpoint?: string;
 
   constructor() {
     this.gitUtils = new GitUtils();
@@ -31,6 +32,7 @@ export class GithubRepoStrategy implements DeploymentStrategy {
     const token = payload.github_token;
 
     let repoDir = '';
+    this.lastPublicEndpoint = undefined;
 
     try {
       // Clone the repository
@@ -74,21 +76,23 @@ export class GithubRepoStrategy implements DeploymentStrategy {
         const serviceName = `${payload.projectSlug}-${payload.serviceId}`;
         const environmentVariables = payload.metadata?.environmentValues || {};
 
-        // Deploy to ECS
-        await this.ecsService.deployService(
+        // Deploy to ECS and get public endpoint
+        const ecsResult = await this.ecsService.deployService(
           serviceName,
           imageUri,
           environmentVariables
         );
+        logger.info(`ECS deployment result: ${JSON.stringify(ecsResult)}`);
+        this.lastPublicEndpoint = ecsResult.publicEndpoint;
+        return true;
       } catch (error) {
         logger.error(`Failed to build and push Docker image: ${error}`);
         throw new Error(`Failed to push Docker image: ${error}`);
       }
 
-      logger.info(`GitHub repo deployment completed for service ID: ${payload.serviceId}`);
-      return true;
     } catch (error) {
       logger.error(`GitHub repo deployment failed: ${error}`);
+      this.lastPublicEndpoint = undefined;
       return false;
     } finally {
       // Clean up repository directory
@@ -96,5 +100,9 @@ export class GithubRepoStrategy implements DeploymentStrategy {
         await this.gitUtils.cleanupRepository(repoDir);
       }
     }
+  }
+
+  getPublicEndpoint(): string | undefined {
+    return this.lastPublicEndpoint;
   }
 }

@@ -96,6 +96,21 @@ The service requires the following environment variables:
 - `LOG_LEVEL`: Logging level (debug, info, warn, error)
 - `TEMP_REPO_DIR`: Temporary directory for cloning repositories
 
+### SQS Status Queue (for deployment status updates)
+- `SQS_STATUS_URL`: SQS queue URL for deployment status/result messages (separate from deployment request queue)
+
+### Cloudflare DNS Automation
+- `CLOUDFLARE_API_TOKEN`: Cloudflare API token (must have DNS:Edit permission for the zone)
+- `CLOUDFLARE_ZONE_ID`: Cloudflare Zone ID for your domain
+
+## Enhanced Deployment Flow
+
+After a successful deployment to AWS:
+- The service automatically assigns a subdomain (e.g., `projectslug.your-domain.com`) to the deployed website using Cloudflare DNS.
+- It verifies the site is live (HTTP check).
+- It sends a deployment status message (including the assigned URL and build status) to the SQS status queue (`SQS_STATUS_URL`).
+- All actions are logged for traceability.
+
 ## Usage
 
 ### Development

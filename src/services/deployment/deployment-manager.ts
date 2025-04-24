@@ -2,6 +2,8 @@ import logger from '../../utils/logger';
 import { GithubRepoStrategy } from './strategies/github-repo-strategy';
 import { DockerImageStrategy } from './strategies/docker-image-strategy';
 import { SQSProducer } from '../sqs/sqs-producer';
+import { CloudflareDNS } from '../../utils/cloudflare-dns';
+import axios from 'axios';
 
 // Define the deployment types
 export enum ServiceType {
@@ -41,11 +43,12 @@ export interface DeploymentStrategy {
 export class DeploymentManager {
   private strategies: Map<ServiceType, DeploymentStrategy>;
   private sqsProducer: SQSProducer;
+  private statusQueueUrl: string | undefined;
 
-  constructor() {
+  constructor(statusQueueUrl?: string) {
     this.strategies = new Map();
     this.sqsProducer = new SQSProducer();
-
+    this.statusQueueUrl = statusQueueUrl || process.env.SQS_STATUS_URL;
     // Register strategies
     this.strategies.set(ServiceType.GITHUB_REPO, new GithubRepoStrategy());
     this.strategies.set(ServiceType.DOCKER_IMAGE, new DockerImageStrategy());
@@ -75,7 +78,11 @@ export class DeploymentManager {
 
     try {
       // Update deployment status to IN_PROGRESS
-      await this.updateDeploymentStatus(payload, DeploymentStatus.IN_PROGRESS);
+      if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
+        await this.updateDeploymentStatus(payload, DeploymentStatus.IN_PROGRESS);
+      } else {
+        logger.info('Skipping SQS deployment status update (IN_PROGRESS) due to SKIP_DEPLOYMENT_STATUS_SQS=true');
+      }
 
       // Get the appropriate strategy
       const strategy = this.strategies.get(payload.type as ServiceType);
@@ -86,18 +93,73 @@ export class DeploymentManager {
 
       // Execute the deployment
       const success = await strategy.deploy(payload);
+      let publicEndpoint: string | undefined;
+      if (payload.type === ServiceType.GITHUB_REPO && typeof (strategy as any).getPublicEndpoint === 'function') {
+        publicEndpoint = (strategy as any).getPublicEndpoint();
+      }
+      let assignedUrl: string | undefined;
+      if (success && publicEndpoint) {
+        // Assign subdomain via Cloudflare
+        const domain = process.env.DOMAIN || 'your-domain.com';
+        const subdomain = payload.projectSlug;
+        try {
+          const urlResult = await CloudflareDNS.upsertDNSRecord(subdomain, domain, publicEndpoint, 'CNAME');
+          assignedUrl = urlResult || undefined;
+          logger.info(`Assigned subdomain: ${assignedUrl} -> ${publicEndpoint}`);
+          // Optionally, verify the site is live
+          const urlToCheck = `http://${assignedUrl}`;
+          try {
+            await axios.get(urlToCheck, { timeout: 10000 });
+            logger.info(`Verified site is live at ${urlToCheck}`);
+          } catch (err) {
+            logger.warn(`Could not verify site is live at ${urlToCheck}: ${err}`);
+          }
+        } catch (err) {
+          logger.error(`Failed to assign subdomain via Cloudflare: ${err}`);
+        }
+      }
 
-      // Update deployment status based on result
+      // Update deployment status based on result, include URL if available
       if (success) {
-        await this.updateDeploymentStatus(payload, DeploymentStatus.COMPLETED);
+        if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
+          await this.updateDeploymentStatus({ ...payload, deploymentUrl: assignedUrl }, DeploymentStatus.COMPLETED);
+        } else {
+          logger.info('Skipping SQS deployment status update (COMPLETED) due to SKIP_DEPLOYMENT_STATUS_SQS=true');
+        }
         logger.info(`Deployment completed successfully for service ID: ${payload.serviceId}`);
+        // Send SQS message with deployment URL, status, and project info
+        if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
+          await this.sqsProducer.sendMessage(
+            {
+              serviceId: payload.serviceId,
+              projectSlug: payload.projectSlug,
+              status: DeploymentStatus.COMPLETED,
+              deploymentUrl: assignedUrl,
+              publicEndpoint,
+              timestamp: new Date().toISOString(),
+            },
+            'deployment:status-update',
+            `deployment-${payload.serviceId}`,
+            this.statusQueueUrl // Pass status queue URL if set
+          );
+        } else {
+          logger.info('Skipping SQS deployment status sendMessage (COMPLETED) due to SKIP_DEPLOYMENT_STATUS_SQS=true');
+        }
       } else {
-        await this.updateDeploymentStatus(payload, DeploymentStatus.FAILED);
+        if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
+          await this.updateDeploymentStatus(payload, DeploymentStatus.FAILED);
+        } else {
+          logger.info('Skipping SQS deployment status update (FAILED) due to SKIP_DEPLOYMENT_STATUS_SQS=true');
+        }
         logger.error(`Deployment failed for service ID: ${payload.serviceId}`);
       }
     } catch (error) {
       logger.error(`Error during deployment: ${error}`);
-      await this.updateDeploymentStatus(payload, DeploymentStatus.FAILED, error);
+      if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
+        await this.updateDeploymentStatus(payload, DeploymentStatus.FAILED, error);
+      } else {
+        logger.info('Skipping SQS deployment status update (FAILED, error) due to SKIP_DEPLOYMENT_STATUS_SQS=true');
+      }
     }
   }
 
@@ -106,6 +168,10 @@ export class DeploymentManager {
     status: DeploymentStatus,
     error?: any
   ): Promise<void> {
+    if (process.env.SKIP_DEPLOYMENT_STATUS_SQS === 'true') {
+      logger.info('Skipping updateDeploymentStatus SQS message due to SKIP_DEPLOYMENT_STATUS_SQS=true');
+      return;
+    }
     try {
       // Create the status update message
       const statusUpdateMessage = {

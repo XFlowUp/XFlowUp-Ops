@@ -35,11 +35,10 @@ export class SQSProducer {
     this.isFifo = process.env.SQS_IS_FIFO === 'true';
   }
 
-  async sendMessage(message: any, jobType: string, messageGroupId: string = 'general'): Promise<string> {
+  async sendMessage(message: any, jobType: string, messageGroupId: string = 'general', overrideQueueUrl?: string): Promise<string> {
     const messageId = uuidv4();
-    
     const sqsMessage: any = {
-      QueueUrl: this.queueUrl,
+      QueueUrl: overrideQueueUrl || this.queueUrl,
       MessageBody: JSON.stringify({
         messageId,
         message,
@@ -52,12 +51,10 @@ export class SQSProducer {
         },
       }),
     };
-
     if (this.isFifo) {
       sqsMessage.MessageGroupId = messageGroupId;
       sqsMessage.MessageDeduplicationId = messageId;
     }
-
     try {
       const result = await this.sqs.sendMessage(sqsMessage);
       logger.info(`Message sent to SQS: ${messageId}, job: ${jobType}`);

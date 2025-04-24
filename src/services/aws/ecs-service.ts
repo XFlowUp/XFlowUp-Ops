@@ -9,6 +9,7 @@ import {
   KeyValuePair
 } from '@aws-sdk/client-ecs';
 import { IAM, GetRoleCommand } from '@aws-sdk/client-iam';
+import { ElasticLoadBalancingV2 } from '@aws-sdk/client-elastic-load-balancing-v2';
 import dotenv from 'dotenv';
 import logger from '../../utils/logger';
 
@@ -17,6 +18,7 @@ dotenv.config();
 export class ECSService {
   private ecs: ECS;
   private iam: IAM;
+  private elbv2: ElasticLoadBalancingV2;
   private cluster: string;
   private executionRoleArn: string;
   private vpcId: string;
@@ -46,6 +48,15 @@ export class ECSService {
 
     // Initialize IAM client
     this.iam = new IAM({
+      region,
+      credentials: {
+        accessKeyId,
+        secretAccessKey,
+      },
+    });
+
+    // Initialize ELBv2 client
+    this.elbv2 = new ElasticLoadBalancingV2({
       region,
       credentials: {
         accessKeyId,
@@ -117,7 +128,7 @@ export class ECSService {
     serviceName: string,
     imageUri: string,
     environmentVariables: Record<string, string> = {}
-  ): Promise<string> {
+  ): Promise<{ serviceName: string; publicEndpoint?: string }> {
     try {
       logger.info(`Deploying ECS service: ${serviceName} with image: ${imageUri}`);
 
@@ -203,7 +214,7 @@ export class ECSService {
               logger.info(`Creating new service after ServiceNotActiveException: ${serviceName}`);
               await this.createService(serviceName, taskDefinitionArn);
               logger.info(`Successfully recreated service after ServiceNotActiveException: ${serviceName}`);
-              return serviceName; // Return success if we managed to recreate the service
+              return { serviceName }; // Return success if we managed to recreate the service
             }
           } catch (recreateError) {
             logger.error(`Failed to recreate service after ServiceNotActiveException: ${recreateError}`);
@@ -220,7 +231,7 @@ export class ECSService {
             logger.info(`Creating new service after waiting for draining to complete: ${serviceName}`);
             await this.createService(serviceName, taskDefinitionArn);
             logger.info(`Successfully created service after waiting for draining: ${serviceName}`);
-            return serviceName; // Return success if we managed to create the service
+            return { serviceName }; // Return success if we managed to create the service
           } catch (recreateError) {
             logger.error(`Failed to create service after waiting for draining: ${recreateError}`);
           }
@@ -238,10 +249,49 @@ export class ECSService {
         // We'll return success even if ECS deployment fails, since the Docker image was built
       }
 
-      return serviceName;
+      // Fetch the public endpoint (ALB DNS or public IP)
+      const publicEndpoint = await this.getServicePublicEndpoint(serviceName);
+      logger.info(`Fetched public endpoint for service ${serviceName}: ${publicEndpoint}`);
+      return { serviceName, publicEndpoint };
     } catch (error) {
       logger.error(`Failed to deploy service: ${error}`);
       throw error;
+    }
+  }
+
+  // Add a new method to fetch the public endpoint (ALB DNS or public IP)
+  private async getServicePublicEndpoint(serviceName: string): Promise<string | undefined> {
+    try {
+      const response = await this.ecs.send(
+        new DescribeServicesCommand({
+          cluster: this.cluster,
+          services: [serviceName],
+        })
+      );
+      if (response.services && response.services.length > 0) {
+        const service = response.services[0];
+        // Try to get the load balancer DNS name if available
+        if (service.loadBalancers && service.loadBalancers.length > 0) {
+          const lbName = service.loadBalancers[0].loadBalancerName;
+          if (lbName) {
+            // Use ELBv2 API to get the DNS name
+            const lbResponse = await this.elbv2.describeLoadBalancers({ Names: [lbName] });
+            if (lbResponse.LoadBalancers && lbResponse.LoadBalancers.length > 0) {
+              const dnsName = lbResponse.LoadBalancers[0].DNSName;
+              logger.info(`Resolved ALB DNS name for ${lbName}: ${dnsName}`);
+              return dnsName;
+            } else {
+              logger.warn(`Could not resolve DNS name for load balancer: ${lbName}`);
+            }
+          }
+        }
+        // If no load balancer, try to get the network interface public IP (for Fargate with public IP)
+        // This requires additional API calls (not implemented here for brevity)
+      }
+      return undefined;
+    } catch (error) {
+      logger.warn(`Could not fetch public endpoint for service ${serviceName}: ${error}`);
+      return undefined;
     }
   }
 

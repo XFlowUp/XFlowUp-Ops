@@ -41,8 +41,8 @@ async function sendTestMessage() {
         userId: 456,
         github_token: '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', // Replace with a valid GitHub token
         githubRepository: {
-          url: 'https://github.com/n0xgg04/itptit-wiki', // Replace with a valid repository URL
-          branch: 'master'
+          url: 'https://github.com/h3nr1-HieuLD/DefaultNextJS.git', // Replace with a valid repository URL
+          branch: 'main'
         },
         metadata: {
           environmentId: '1',
@@ -56,7 +56,7 @@ async function sendTestMessage() {
       MessageAttributes: {
         job: {
           DataType: 'String',
-          StringValue: 'deployment:request'
+          StringValue: 'deployment:production'
         }
       }
     };

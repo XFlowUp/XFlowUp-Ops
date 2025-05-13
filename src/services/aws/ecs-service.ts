@@ -12,6 +12,7 @@ import { IAM, GetRoleCommand } from '@aws-sdk/client-iam';
 import { ElasticLoadBalancingV2 } from '@aws-sdk/client-elastic-load-balancing-v2';
 import dotenv from 'dotenv';
 import logger from '../../utils/logger';
+import { CloudflareDNS } from '../../utils/cloudflare-dns';
 
 dotenv.config();
 
@@ -124,20 +125,34 @@ export class ECSService {
     }
   }
 
+  /**
+   * Deploy ECS service and optionally link a custom domain.
+   * @param serviceName
+   * @param imageUri
+   * @param environmentVariables
+   * @param containerPort
+   * @param customDomain (optional) - full domain to link, e.g. app.example.com
+   * @param healthCheckPath (optional) - health check path
+   */
   async deployService(
     serviceName: string,
     imageUri: string,
-    environmentVariables: Record<string, string> = {}
-  ): Promise<{ serviceName: string; publicEndpoint?: string }> {
+    environmentVariables: Record<string, string> = {},
+    containerPort?: number,
+    customDomain?: string,
+    healthCheckPath?: string // Optional health check path
+  ): Promise<{ serviceName: string; publicEndpoint?: string; healthy: boolean; healthError?: string; customDomainUrl?: string }> {
     try {
       logger.info(`Deploying ECS service: ${serviceName} with image: ${imageUri}`);
+      const port = containerPort || 3000;
 
       // Register task definition outside the inner try block so it's available in the catch block
       logger.info(`Registering task definition for service: ${serviceName}`);
       const taskDefinitionArn = await this.registerTaskDefinition(
         serviceName,
         imageUri,
-        environmentVariables
+        environmentVariables,
+        port
       );
       logger.info(`Task definition registered with ARN: ${taskDefinitionArn}`);
 
@@ -157,11 +172,11 @@ export class ECSService {
 
             if (deleted) {
               logger.info(`Creating new service after forced deletion: ${serviceName}`);
-              await this.createService(serviceName, taskDefinitionArn);
+              await this.createService(serviceName, taskDefinitionArn, port);
             } else {
               logger.warn(`Failed to delete service for forced recreation. Attempting to update: ${serviceName}`);
               try {
-                await this.updateService(serviceName, taskDefinitionArn);
+                await this.updateService(serviceName, taskDefinitionArn, port);
               } catch (updateError) {
                 logger.error(`Failed to update service after failed forced deletion: ${updateError}`);
                 throw new Error(`Service could not be deleted or updated for forced recreation: ${serviceName}`);
@@ -170,7 +185,7 @@ export class ECSService {
           } else if (serviceStatus.isActive) {
             // Update existing active service
             logger.info(`Updating existing active service: ${serviceName}`);
-            await this.updateService(serviceName, taskDefinitionArn);
+            await this.updateService(serviceName, taskDefinitionArn, port);
           } else {
             // Service exists but is not active - delete and recreate
             logger.info(`Service ${serviceName} exists but is not in ACTIVE state. Deleting and recreating...`);
@@ -181,12 +196,12 @@ export class ECSService {
 
             if (deleted) {
               logger.info(`Creating new service after deleting old inactive one: ${serviceName}`);
-              await this.createService(serviceName, taskDefinitionArn);
+              await this.createService(serviceName, taskDefinitionArn, port);
             } else {
               // If deletion failed, try to update anyway
               logger.warn(`Failed to delete inactive service. Attempting to update anyway: ${serviceName}`);
               try {
-                await this.updateService(serviceName, taskDefinitionArn);
+                await this.updateService(serviceName, taskDefinitionArn, port);
               } catch (updateError) {
                 logger.error(`Failed to update service after failed deletion: ${updateError}`);
                 throw new Error(`Service is not active and could not be deleted or updated: ${serviceName}`);
@@ -196,7 +211,7 @@ export class ECSService {
         } else {
           // Create new service
           logger.info(`Creating new service: ${serviceName}`);
-          await this.createService(serviceName, taskDefinitionArn);
+          await this.createService(serviceName, taskDefinitionArn, port);
         }
 
         logger.info(`Successfully deployed ECS service: ${serviceName}`);
@@ -212,12 +227,13 @@ export class ECSService {
 
             if (deleted) {
               logger.info(`Creating new service after ServiceNotActiveException: ${serviceName}`);
-              await this.createService(serviceName, taskDefinitionArn);
+              await this.createService(serviceName, taskDefinitionArn, port);
               logger.info(`Successfully recreated service after ServiceNotActiveException: ${serviceName}`);
-              return { serviceName }; // Return success if we managed to recreate the service
+              return { serviceName, healthy: false, healthError: 'Service was not active and had to be recreated.' };
             }
           } catch (recreateError) {
             logger.error(`Failed to recreate service after ServiceNotActiveException: ${recreateError}`);
+            return { serviceName, healthy: false, healthError: 'Failed to recreate service after ServiceNotActiveException.' };
           }
         } else if (error.name === 'InvalidParameterException' && error.message.includes('still Draining')) {
           logger.error(`ECS deployment error: Service is still draining. ${error.message}`);
@@ -229,20 +245,25 @@ export class ECSService {
 
             // Now try to create the service again
             logger.info(`Creating new service after waiting for draining to complete: ${serviceName}`);
-            await this.createService(serviceName, taskDefinitionArn);
+            await this.createService(serviceName, taskDefinitionArn, port);
             logger.info(`Successfully created service after waiting for draining: ${serviceName}`);
-            return { serviceName }; // Return success if we managed to create the service
+            return { serviceName, healthy: false, healthError: 'Service was draining and had to be recreated.' };
           } catch (recreateError) {
             logger.error(`Failed to create service after waiting for draining: ${recreateError}`);
+            return { serviceName, healthy: false, healthError: 'Failed to create service after waiting for draining.' };
           }
         } else if (error.name === 'ClientException' && error.message.includes('networkMode=awsvpc')) {
           logger.error(`ECS deployment error: When using awsvpc network mode, host ports and container ports must match. ${error.message}`);
+          return { serviceName, healthy: false, healthError: 'awsvpc network mode port mismatch.' };
         } else if (error.name === 'InvalidParameterException' && error.message.includes('subnet')) {
           logger.error(`ECS deployment error: Invalid subnet configuration. ${error.message}`);
+          return { serviceName, healthy: false, healthError: 'Invalid subnet configuration.' };
         } else if (error.name === 'InvalidParameterException' && error.message.includes('security group')) {
           logger.error(`ECS deployment error: Invalid security group configuration. ${error.message}`);
+          return { serviceName, healthy: false, healthError: 'Invalid security group configuration.' };
         } else {
           logger.error(`Failed to deploy to ECS: ${error}`);
+          return { serviceName, healthy: false, healthError: 'Failed to deploy to ECS.' };
         }
 
         logger.info('Skipping ECS deployment. The Docker image was built successfully and can be used manually.');
@@ -250,9 +271,41 @@ export class ECSService {
       }
 
       // Fetch the public endpoint (ALB DNS or public IP)
-      const publicEndpoint = await this.getServicePublicEndpoint(serviceName);
-      logger.info(`Fetched public endpoint for service ${serviceName}: ${publicEndpoint}`);
-      return { serviceName, publicEndpoint };
+      // --- BEGIN: Wait for public endpoint to become available ---
+      let publicEndpoint: string | undefined = undefined;
+      const maxEndpointAttempts = 10;
+      const endpointDelayMs = 5000;
+      for (let attempt = 1; attempt <= maxEndpointAttempts; attempt++) {
+        publicEndpoint = await this.getServicePublicEndpoint(serviceName);
+        logger.info(`Fetched public endpoint for service ${serviceName} (attempt ${attempt}): ${publicEndpoint}`);
+        if (publicEndpoint) break;
+        if (attempt < maxEndpointAttempts) {
+          await new Promise(res => setTimeout(res, endpointDelayMs));
+        }
+      }
+      if (!publicEndpoint) {
+        logger.error(`Public endpoint (ALB DNS) is required for DNS linking but was not found after ${maxEndpointAttempts} attempts.`);
+        throw new Error('Public endpoint (ALB DNS) is required for DNS linking but was not found.');
+      }
+      // --- END: Wait for public endpoint to become available ---
+      // Health check logic
+      const { healthy, healthError } = await this.waitForServiceHealthy(serviceName, publicEndpoint, healthCheckPath);
+      if (!healthy) {
+        logger.error(`ECS service ${serviceName} is not healthy: ${healthError}`);
+      }
+      // Link custom domain if provided and public endpoint is available
+      let customDomainUrl: string | undefined = undefined;
+      if (customDomain && publicEndpoint) {
+        logger.info(`Linking custom domain ${customDomain} to ECS service ${serviceName}`);
+        const dnsResult = await this.linkCustomDomain(customDomain, publicEndpoint);
+        if (dnsResult) {
+          customDomainUrl = customDomain;
+          logger.info(`Custom domain ${customDomain} successfully linked to ${publicEndpoint}`);
+        } else {
+          logger.warn(`Failed to link custom domain ${customDomain}`);
+        }
+      }
+      return { serviceName, publicEndpoint, healthy, healthError, customDomainUrl };
     } catch (error) {
       logger.error(`Failed to deploy service: ${error}`);
       throw error;
@@ -272,16 +325,39 @@ export class ECSService {
         const service = response.services[0];
         // Try to get the load balancer DNS name if available
         if (service.loadBalancers && service.loadBalancers.length > 0) {
-          const lbName = service.loadBalancers[0].loadBalancerName;
-          if (lbName) {
-            // Use ELBv2 API to get the DNS name
-            const lbResponse = await this.elbv2.describeLoadBalancers({ Names: [lbName] });
+          const lb = service.loadBalancers[0];
+          // Try by loadBalancerName (classic LB)
+          if (lb.loadBalancerName) {
+            const lbResponse = await this.elbv2.describeLoadBalancers({ Names: [lb.loadBalancerName] });
             if (lbResponse.LoadBalancers && lbResponse.LoadBalancers.length > 0) {
               const dnsName = lbResponse.LoadBalancers[0].DNSName;
-              logger.info(`Resolved ALB DNS name for ${lbName}: ${dnsName}`);
+              logger.info(`Resolved ALB DNS name for ${lb.loadBalancerName}: ${dnsName}`);
               return dnsName;
             } else {
-              logger.warn(`Could not resolve DNS name for load balancer: ${lbName}`);
+              logger.warn(`Could not resolve DNS name for load balancer: ${lb.loadBalancerName}`);
+            }
+          }
+          // Try by targetGroupArn (ALB/NLB)
+          if (lb.targetGroupArn) {
+            const tgResponse = await this.elbv2.describeTargetGroups({ TargetGroupArns: [lb.targetGroupArn] });
+            if (tgResponse.TargetGroups && tgResponse.TargetGroups.length > 0) {
+              const tg = tgResponse.TargetGroups[0];
+              if (tg.LoadBalancerArns && tg.LoadBalancerArns.length > 0) {
+                // Use the first associated load balancer
+                const albArn = tg.LoadBalancerArns[0];
+                const albResponse = await this.elbv2.describeLoadBalancers({ LoadBalancerArns: [albArn] });
+                if (albResponse.LoadBalancers && albResponse.LoadBalancers.length > 0) {
+                  const dnsName = albResponse.LoadBalancers[0].DNSName;
+                  logger.info(`Resolved ALB DNS name for ${albArn}: ${dnsName}`);
+                  return dnsName;
+                } else {
+                  logger.warn(`Could not resolve DNS name for ALB ARN: ${albArn}`);
+                }
+              } else {
+                logger.warn(`No LoadBalancerArns found for target group: ${lb.targetGroupArn}`);
+              }
+            } else {
+              logger.warn(`Could not describe target group: ${lb.targetGroupArn}`);
             }
           }
         }
@@ -298,7 +374,8 @@ export class ECSService {
   private async registerTaskDefinition(
     serviceName: string,
     imageUri: string,
-    environmentVariables: Record<string, string>
+    environmentVariables: Record<string, string>,
+    containerPort: number
   ): Promise<string> {
     // Convert environment variables to ECS format
     const environment: KeyValuePair[] = Object.entries(environmentVariables).map(
@@ -316,8 +393,8 @@ export class ECSService {
       environment,
       portMappings: [
         {
-          containerPort: 3000, // Assuming the app runs on port 3000
-          hostPort: 3000, // When using awsvpc network mode, hostPort must match containerPort
+          containerPort,
+          hostPort: containerPort,
           protocol: 'tcp',
         },
       ],
@@ -489,14 +566,125 @@ export class ECSService {
     logger.warn(`Reached maximum wait attempts for service ${serviceName} to be deleted. Proceeding anyway.`);
   }
 
+  /**
+   * Automatically create and attach a Target Group and Listener Rule for the ECS service if not present.
+   * This ensures the ALB is always connected to the ECS service on creation.
+   * @param serviceName
+   * @param containerPort
+   * @returns {Promise<{targetGroupArn: string, listenerArn: string}>}
+   */
+  private async ensureTargetGroupAndListener(serviceName: string, containerPort: number): Promise<{ targetGroupArn: string, listenerArn: string }> {
+    let targetGroupArn = process.env.AWS_ALB_TARGET_GROUP_ARN;
+    const listenerArn = process.env.AWS_ALB_LISTENER_ARN;
+    if (!listenerArn) {
+      throw new Error('Missing AWS_ALB_LISTENER_ARN in environment variables');
+    }
+    // If a target group ARN is provided, check its type
+    if (targetGroupArn && !targetGroupArn.includes('<REQUIRED')) {
+      const describeRes = await this.elbv2.describeTargetGroups({ TargetGroupArns: [targetGroupArn] });
+      const tg = describeRes.TargetGroups && describeRes.TargetGroups[0];
+      if (!tg) {
+        throw new Error(`Target group ARN ${targetGroupArn} not found.`);
+      }
+      if (tg.TargetType !== 'ip') {
+        throw new Error(`Target group ${targetGroupArn} has type '${tg.TargetType}'. It must be 'ip' for ECS Fargate/awsvpc. Please create a new target group of type 'ip'.`);
+      }
+    } else {
+      // Create a new target group for this service
+      const tgName = serviceName.length > 32 ? serviceName.substring(0, 32) : serviceName;
+      const tgRes = await this.elbv2.createTargetGroup({
+        Name: tgName,
+        Protocol: 'HTTP',
+        Port: containerPort,
+        VpcId: this.vpcId,
+        TargetType: 'ip',
+        HealthCheckPath: '/health',
+        HealthCheckProtocol: 'HTTP',
+      });
+      if (!tgRes.TargetGroups || !tgRes.TargetGroups[0].TargetGroupArn) {
+        throw new Error('Failed to create Target Group for ECS service');
+      }
+      targetGroupArn = tgRes.TargetGroups[0].TargetGroupArn;
+      logger.info(`Created new Target Group: ${targetGroupArn}`);
+    }
+    // Attach a listener rule for this target group, using a truly free priority
+    let ruleCreated = false;
+    let lastError = null;
+    // Get all existing priorities for this listener
+    const rulesRes = await this.elbv2.describeRules({ ListenerArn: listenerArn });
+    const usedPriorities = new Set<number>();
+    for (const rule of rulesRes.Rules || []) {
+      if (rule.Priority && rule.Priority !== 'default') {
+        usedPriorities.add(Number(rule.Priority));
+      }
+    }
+    // Try to find a free priority in the allowed range
+    let priority = Math.abs(this.hashString(serviceName)) % 50000 + 1;
+    let attempts = 0;
+    while (usedPriorities.has(priority) && attempts < 50000) {
+      priority = (priority % 50000) + 1;
+      attempts++;
+    }
+    if (usedPriorities.has(priority)) {
+      throw new Error('Could not find a free ALB listener rule priority after 50000 attempts.');
+    }
+    const pathPattern = `/${serviceName}/*`;
+    try {
+      await this.elbv2.createRule({
+        ListenerArn: listenerArn,
+        Priority: priority,
+        Conditions: [
+          {
+            Field: 'path-pattern',
+            Values: [pathPattern],
+          },
+        ],
+        Actions: [
+          {
+            Type: 'forward',
+            TargetGroupArn: targetGroupArn,
+          },
+        ],
+      });
+      logger.info(`Created ALB listener rule for service ${serviceName} at path ${pathPattern} with priority ${priority}`);
+      ruleCreated = true;
+    } catch (err: any) {
+      lastError = err;
+      if (err.name === 'DuplicateRule') {
+        logger.warn(`Listener rule for path ${pathPattern} already exists, skipping rule creation.`);
+        ruleCreated = true;
+      } else {
+        logger.error(`Failed to create ALB listener rule: ${err}`);
+      }
+    }
+    if (!ruleCreated) {
+      throw new Error(`Failed to create ALB listener rule for service ${serviceName}: ${lastError}`);
+    }
+    return { targetGroupArn, listenerArn };
+  }
+
+  // Simple hash for string to int (for ALB rule priority)
+  private hashString(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash) + str.charCodeAt(i);
+      hash |= 0;
+    }
+    return hash;
+  }
+
   private async createService(
     serviceName: string,
-    taskDefinitionArn: string
+    taskDefinitionArn: string,
+    containerPort: number
   ): Promise<void> {
     try {
       logger.info(`Creating new ECS service: ${serviceName} with task definition: ${taskDefinitionArn}`);
       logger.info(`Using subnets: ${this.subnetIds.join(', ')}`);
       logger.info(`Using security group: ${this.securityGroupId}`);
+
+      // Always ensure Target Group and Listener Rule exist for this service
+      const { targetGroupArn } = await this.ensureTargetGroupAndListener(serviceName, containerPort);
 
       const response = await this.ecs.send(
         new CreateServiceCommand({
@@ -512,6 +700,13 @@ export class ECSService {
               assignPublicIp: 'ENABLED',
             },
           },
+          loadBalancers: [
+            {
+              targetGroupArn,
+              containerName: serviceName,
+              containerPort,
+            },
+          ],
         })
       );
 
@@ -533,12 +728,16 @@ export class ECSService {
 
   private async updateService(
     serviceName: string,
-    taskDefinitionArn: string
+    taskDefinitionArn: string,
+    containerPort: number
   ): Promise<void> {
     try {
       logger.info(`Updating existing ECS service: ${serviceName} with task definition: ${taskDefinitionArn}`);
       logger.info(`Using subnets: ${this.subnetIds.join(', ')}`);
       logger.info(`Using security group: ${this.securityGroupId}`);
+
+      // Always ensure Target Group and Listener Rule exist for this service
+      const { targetGroupArn } = await this.ensureTargetGroupAndListener(serviceName, containerPort);
 
       const response = await this.ecs.send(
         new UpdateServiceCommand({
@@ -554,6 +753,13 @@ export class ECSService {
               assignPublicIp: 'ENABLED',
             },
           },
+          loadBalancers: [
+            {
+              targetGroupArn,
+              containerName: serviceName,
+              containerPort,
+            },
+          ],
         })
       );
 
@@ -571,5 +777,88 @@ export class ECSService {
       }
       throw error;
     }
+  }
+
+  /**
+   * Link a custom domain to the ECS service by updating the DNS record via Cloudflare.
+   * @param customDomain The full custom domain (e.g., app.example.com)
+   * @param publicEndpoint The ALB DNS name to point the domain to
+   * @returns The DNS record name if successful
+   */
+  async linkCustomDomain(customDomain: string, publicEndpoint: string): Promise<string | null> {
+    if (!customDomain || !publicEndpoint) {
+      logger.warn('Custom domain or public endpoint not provided. Skipping DNS linking.');
+      return null;
+    }
+    // Split domain into subdomain and root domain (e.g., sub.example.com -> sub, example.com)
+    const parts = customDomain.split('.');
+    if (parts.length < 2) {
+      logger.error('Invalid custom domain format.');
+      return null;
+    }
+    const domain = parts.slice(-2).join('.');
+    const subdomain = parts.slice(0, -2).join('.') || '@';
+    // Use CNAME for subdomains, A for apex if needed (Cloudflare recommends CNAME for ALB)
+    const type = 'CNAME';
+    logger.info(`Linking custom domain ${customDomain} to ALB endpoint ${publicEndpoint}`);
+    try {
+      const record = await CloudflareDNS.upsertDNSRecord(subdomain, domain, publicEndpoint, type);
+      logger.info(`Custom domain ${customDomain} now points to ${publicEndpoint}`);
+      return record;
+    } catch (err) {
+      logger.error(`Failed to link custom domain: ${err}`);
+      return null;
+    }
+  }
+
+  // Wait for ECS service and ALB endpoint to be healthy
+  private async waitForServiceHealthy(serviceName: string, publicEndpoint?: string, healthCheckPath?: string): Promise<{ healthy: boolean; healthError?: string }> {
+    // If no healthCheckPath is provided, skip ALB health check and only check ECS status
+    const maxAttempts = 20;
+    const delayMs = 10000; // 10 seconds
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        // Check ECS service health
+        const response = await this.ecs.send(new DescribeServicesCommand({
+          cluster: this.cluster,
+          services: [serviceName],
+        }));
+        const service = response.services?.[0];
+        if (!service) {
+          return { healthy: false, healthError: 'Service not found' };
+        }
+        const running = service.runningCount || 0;
+        const desired = service.desiredCount || 1;
+        const status = service.status;
+        const health = service.deployments?.every(dep => dep.rolloutState === 'COMPLETED');
+        if (status === 'ACTIVE' && running === desired && health) {
+          // Only check ALB endpoint if healthCheckPath is provided
+          if (publicEndpoint && healthCheckPath) {
+            try {
+              const controller = new AbortController();
+              const timeout = setTimeout(() => controller.abort(), 5000);
+              const res = await fetch(`http://${publicEndpoint}${healthCheckPath}`, { method: 'GET', signal: controller.signal });
+              clearTimeout(timeout);
+              if (res.ok) {
+                logger.info(`Health check passed for ALB endpoint: http://${publicEndpoint}${healthCheckPath}`);
+                return { healthy: true };
+              }
+            } catch (err) {
+              logger.warn(`ALB endpoint not healthy yet: ${err}`);
+            }
+          } else {
+            // No health check path provided, consider service healthy if ECS is healthy
+            logger.info('No healthCheckPath provided, skipping ALB health check. Considering service healthy if ECS is healthy.');
+            return { healthy: true };
+          }
+        }
+        logger.info(`Waiting for ECS service to be healthy (attempt ${attempt}/${maxAttempts})...`);
+        await new Promise(res => setTimeout(res, delayMs));
+      } catch (err) {
+        logger.warn(`Error during health check: ${err}`);
+        await new Promise(res => setTimeout(res, delayMs));
+      }
+    }
+    return { healthy: false, healthError: 'Timed out waiting for ECS/ALB health' };
   }
 }

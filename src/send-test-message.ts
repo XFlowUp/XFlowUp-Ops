@@ -50,7 +50,8 @@ async function sendTestMessage() {
             PORT: '3000',
             NODE_ENV: 'production'
           }
-        }
+        },
+        containerPort: 3000 // <--- Add this line to explicitly set the port
       },
       date: new Date().toISOString(),
       MessageAttributes: {

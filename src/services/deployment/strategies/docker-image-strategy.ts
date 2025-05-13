@@ -11,32 +11,52 @@ export class DockerImageStrategy implements DeploymentStrategy {
   }
 
   async deploy(payload: DeploymentRequestPayload): Promise<boolean> {
-    logger.info(`Starting Docker image deployment for service ID: ${payload.serviceId}`);
+    const context = {
+      serviceId: payload.serviceId,
+      projectSlug: payload.projectSlug,
+      deploymentId: payload.messageId || payload.deploymentId || undefined,
+      type: payload.type
+    };
+    logger.info(`[context] Starting Docker image deployment`, context);
+    // TODO: metrics: increment docker_image_deploy_started
     this.lastPublicEndpoint = undefined;
     try {
       if (!payload.docker_image_url) {
+        logger.error(`[context] Docker image URL is missing`, context);
+        // TODO: metrics: increment docker_image_deploy_failed
         throw new Error('Docker image URL is missing');
       }
       // Get the Docker image URL and tag
       const imageUrl = payload.docker_image_url;
       const imageTag = payload.docker_image_tag || 'latest';
       const imageUri = `${imageUrl}:${imageTag}`;
+      logger.info(`[context] Using image URI: ${imageUri}`, context);
       // Create or update ECS service
       const serviceName = `${payload.projectSlug}-${payload.serviceId}`;
       const environmentVariables = payload.metadata?.environmentValues || {};
-      // Deploy to ECS and get public endpoint
+      let containerPort = 3000;
+      if (payload.containerPort) {
+        containerPort = payload.containerPort;
+      } else if (environmentVariables.PORT && !isNaN(Number(environmentVariables.PORT))) {
+        containerPort = Number(environmentVariables.PORT);
+      }
+      logger.info(`[context] Deploying to ECS: ${serviceName} on port ${containerPort}`, context);
+      // TODO: metrics: increment ecs_deploy_started
       const ecsResult = await this.ecsService.deployService(
         serviceName,
         imageUri,
-        environmentVariables
+        environmentVariables,
+        containerPort
       );
-      logger.info(`ECS deployment result: ${JSON.stringify(ecsResult)}`);
+      logger.info(`[context] ECS deployment result: ${JSON.stringify(ecsResult)}`, context);
+      // TODO: metrics: increment ecs_deploy_success if ecsResult.healthy
       this.lastPublicEndpoint = ecsResult.publicEndpoint;
-      logger.info(`Docker image deployment completed for service ID: ${payload.serviceId}`);
-      return true;
+      logger.info(`[context] Docker image deployment completed for service ID: ${payload.serviceId}`, context);
+      return ecsResult.healthy;
     } catch (error) {
-      logger.error(`Docker image deployment failed: ${error}`);
+      logger.error(`[context] Docker image deployment failed: ${error}`, context);
       this.lastPublicEndpoint = undefined;
+      // TODO: metrics: increment docker_image_deploy_failed
       return false;
     }
   }

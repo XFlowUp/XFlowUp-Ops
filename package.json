@@ -14,7 +14,8 @@
     "send-product-deploy": "ts-node src/send-product-message.ts",
     "mock-test": "ts-node src/test-mock.ts",
     "clear-queue": "ts-node src/clear-sqs-queue.ts",
-    "clear-status-queue": "ts-node src/clear-sqs-status-queue.ts"
+    "clear-status-queue": "ts-node src/clear-sqs-status-queue.ts",
+    "ops:setup": "node scripts/ops-setup-and-run.js"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch-logs": "^3.515.0",

@@ -25,6 +25,9 @@ export interface StatusUpdateMessage {
   timestamp: string;
 }
 
+// Simple in-memory idempotency store (for demo; use Redis/DynamoDB for production)
+const processedMessageIds = new Set<string>();
+
 export class SQSConsumer {
   private sqs: SQS;
   private queueUrl: string;
@@ -116,36 +119,44 @@ export class SQSConsumer {
       logger.info(`Raw SQS message: ${JSON.stringify(message)}`);
 
       const body: SQSMessage = JSON.parse(message.Body);
-      logger.info(`Processing message: ${body.messageId}, job: ${body.MessageAttributes?.job?.StringValue}`);
+      const context = {
+        messageId: body.messageId,
+        serviceId: body.message?.serviceId,
+        projectSlug: body.message?.projectSlug,
+        jobType: body.MessageAttributes?.job?.StringValue
+      };
+      logger.info(`[context] Processing message`, context);
 
-      // Log the full parsed message body for debugging
-      logger.info(`Full message body: ${JSON.stringify(body)}`);
+      // Idempotency check
+      if (processedMessageIds.has(body.messageId)) {
+        logger.warn(`[context] Duplicate message detected (idempotency): ${body.messageId}. Skipping.`, context);
+        return;
+      }
+      processedMessageIds.add(body.messageId);
+      // TODO: Use Redis/DynamoDB for distributed idempotency in production
 
-      // Log the message content specifically
-      logger.info(`Message content: ${JSON.stringify(body.message)}`);
+      logger.info(`[context] Full message body: ${JSON.stringify(body)}`, context);
+      logger.info(`[context] Message content: ${JSON.stringify(body.message)}`, context);
 
       // Check the job type
       const jobType = body.MessageAttributes?.job?.StringValue;
 
       if (jobType === 'deployment:product' || jobType === 'deployment:request' || jobType === 'deployment:production') {
-        // Handle deployment request
-        logger.info(`Processing deployment request for job type: ${jobType}`);
+        logger.info(`[context] Processing deployment request for job type: ${jobType}`, context);
+        // TODO: metrics: increment deployment_received
         await this.deploymentManager.handleDeploymentRequest(body.message);
+        // TODO: metrics: increment deployment_success
       } else if (jobType === 'deployment:test') {
-        // Handle test message - just log it without deleting
-        logger.info(`Received test message: ${JSON.stringify(body.message)}`);
-        logger.info(`Test message processed successfully`);
+        logger.info(`[context] Received test message: ${JSON.stringify(body.message)}`, context);
+        logger.info(`[context] Test message processed successfully`, context);
       } else if (jobType === 'deployment:status-update') {
-        // Handle deployment status update
         await this.handleStatusUpdate(body.message);
       } else {
-        // Unknown job type
-        logger.warn(`Unknown job type: ${jobType}`);
+        logger.warn(`[context] Unknown job type: ${jobType}`, context);
       }
     } catch (error) {
-      logger.error(`Error parsing message body: ${error}`);
-      // Don't throw the error, so we can still delete the message
-      // This prevents the message from being processed repeatedly
+      logger.error(`[context] Error parsing message body: ${error}`);
+      // TODO: metrics: increment message_parse_failure
     }
   }
 

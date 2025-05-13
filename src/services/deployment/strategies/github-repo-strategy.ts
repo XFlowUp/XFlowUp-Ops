@@ -22,9 +22,18 @@ export class GithubRepoStrategy implements DeploymentStrategy {
   }
 
   async deploy(payload: DeploymentRequestPayload): Promise<boolean> {
-    logger.info(`Starting GitHub repo deployment for service ID: ${payload.serviceId}`);
+    const context = {
+      serviceId: payload.serviceId,
+      projectSlug: payload.projectSlug,
+      deploymentId: payload.messageId || payload.deploymentId || undefined,
+      type: payload.type
+    };
+    logger.info(`[context] Starting GitHub repo deployment`, context);
+    // TODO: metrics: increment github_deploy_started
 
     if (!payload.githubRepository) {
+      logger.error(`[context] GitHub repository information is missing`, context);
+      // TODO: metrics: increment github_deploy_failed
       throw new Error('GitHub repository information is missing');
     }
 
@@ -35,68 +44,76 @@ export class GithubRepoStrategy implements DeploymentStrategy {
     this.lastPublicEndpoint = undefined;
 
     try {
-      // Clone the repository
-      repoDir = await this.gitUtils.cloneRepository({
-        url,
-        branch,
-        token
-      });
+      logger.info(`[context] Cloning repository: ${url} (branch: ${branch})`, context);
+      // TODO: metrics: increment github_clone_started
+      repoDir = await this.gitUtils.cloneRepository({ url, branch, token });
+      logger.info(`[context] Repository cloned to: ${repoDir}`, context);
+      // TODO: metrics: increment github_clone_success
 
       // Check if Dockerfile exists
       const dockerfilePath = path.join(repoDir, 'Dockerfile');
       if (!fs.existsSync(dockerfilePath)) {
-        logger.info(`Dockerfile not found in the repository. Attempting to generate one...`);
-
+        logger.info(`[context] Dockerfile not found. Attempting to generate one...`, context);
         // Detect project type
         const projectType = this.dockerfileGenerator.detectProjectType(repoDir);
-
         if (projectType === ProjectType.UNKNOWN) {
+          logger.error(`[context] Unable to determine project type. Cannot generate Dockerfile.`, context);
+          // TODO: metrics: increment github_deploy_failed
           throw new Error('Unable to determine project type. Cannot generate Dockerfile.');
         }
-
-        logger.info(`Detected project type: ${projectType}`);
-
+        logger.info(`[context] Detected project type: ${projectType}`, context);
         // Generate Dockerfile
         const success = this.dockerfileGenerator.generateDockerfile(projectType, repoDir);
-
         if (!success) {
+          logger.error(`[context] Failed to generate Dockerfile for ${projectType} project.`, context);
+          // TODO: metrics: increment github_deploy_failed
           throw new Error(`Failed to generate Dockerfile for ${projectType} project.`);
         }
-
-        logger.info(`Successfully generated Dockerfile for ${projectType} project.`);
+        logger.info(`[context] Successfully generated Dockerfile for ${projectType} project.`, context);
       }
 
       // Build and push Docker image
       const imageTag = `${payload.projectSlug}-${payload.serviceId}-${Date.now()}`;
-
+      logger.info(`[context] Building and pushing Docker image: ${imageTag}`, context);
+      // TODO: metrics: increment docker_build_started
       try {
         const imageUri = await this.ecrService.buildAndPushImage(repoDir, imageTag);
-
+        logger.info(`[context] Docker image built and pushed: ${imageUri}`, context);
+        // TODO: metrics: increment docker_build_success
         // Create or update ECS service
         const serviceName = `${payload.projectSlug}-${payload.serviceId}`;
         const environmentVariables = payload.metadata?.environmentValues || {};
-
-        // Deploy to ECS and get public endpoint
+        let containerPort = 3000;
+        if (payload.containerPort) {
+          containerPort = payload.containerPort;
+        } else if (environmentVariables.PORT && !isNaN(Number(environmentVariables.PORT))) {
+          containerPort = Number(environmentVariables.PORT);
+        }
+        logger.info(`[context] Deploying to ECS: ${serviceName} on port ${containerPort}`, context);
+        // TODO: metrics: increment ecs_deploy_started
         const ecsResult = await this.ecsService.deployService(
           serviceName,
           imageUri,
-          environmentVariables
+          environmentVariables,
+          containerPort
         );
-        logger.info(`ECS deployment result: ${JSON.stringify(ecsResult)}`);
+        logger.info(`[context] ECS deployment result: ${JSON.stringify(ecsResult)}`, context);
+        // TODO: metrics: increment ecs_deploy_success if ecsResult.healthy
         this.lastPublicEndpoint = ecsResult.publicEndpoint;
-        return true;
+        return ecsResult.healthy;
       } catch (error) {
-        logger.error(`Failed to build and push Docker image: ${error}`);
-        throw new Error(`Failed to push Docker image: ${error}`);
+        logger.error(`[context] Failed to build/push Docker image or deploy to ECS: ${error}`, context);
+        // TODO: metrics: increment github_deploy_failed
+        throw new Error(`Failed to push Docker image or deploy to ECS: ${error}`);
       }
-
     } catch (error) {
-      logger.error(`GitHub repo deployment failed: ${error}`);
+      logger.error(`[context] GitHub repo deployment failed: ${error}`, context);
       this.lastPublicEndpoint = undefined;
+      // TODO: metrics: increment github_deploy_failed
       return false;
     } finally {
-      // Clean up repository directory
       if (repoDir) {
+        logger.info(`[context] Cleaning up repository directory: ${repoDir}`, context);
         await this.gitUtils.cleanupRepository(repoDir);
       }
     }

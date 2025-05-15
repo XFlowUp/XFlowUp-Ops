@@ -1,0 +1,13 @@
+# Ignore dev/test scripts and files
+src/clear-sqs-queue.ts
+src/clear-sqs-status-queue.ts
+src/send-product-message.ts
+src/send-test-debug-message.ts
+src/send-test-message.ts
+src/test-mock.ts
+tests/
+logs/
+scripts/
+tmp/
+coverage/
+*.log

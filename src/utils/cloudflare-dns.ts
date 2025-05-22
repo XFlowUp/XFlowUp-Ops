@@ -11,27 +11,38 @@ if (!CLOUDFLARE_API_TOKEN || !CLOUDFLARE_ZONE_ID) {
 }
 
 export class CloudflareDNS {
-  static async upsertDNSRecord(subdomain: string, domain: string, target: string, type: 'A' | 'CNAME' = 'CNAME') {
+  /**
+   * Upsert a DNS record (A or CNAME) for a subdomain.
+   * If endpoint is an IP address, use A record. If domain, use CNAME.
+   */
+  static async upsertDNSRecord(subdomain: string, domain: string, endpoint: string, type?: string) {
+    // Determine record type if not provided
+    let recordType = type;
+    if (!recordType) {
+      // Simple IP address regex
+      const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(endpoint);
+      recordType = isIp ? 'A' : 'CNAME';
+    }
     if (!CLOUDFLARE_API_TOKEN || !CLOUDFLARE_ZONE_ID) {
       throw new Error('Cloudflare API token or zone ID not set');
     }
-    if (!target) {
+    if (!endpoint) {
       logger.error(`CloudflareDNS: Target for DNS record is undefined or empty. Skipping DNS step for ${subdomain}.${domain}`);
       return null;
     }
     const name = `${subdomain}.${domain}`;
-    logger.debug(`[CloudflareDNS] Upsert DNS: name=${name}, target=${target}, type=${type}`);
+    logger.debug(`[CloudflareDNS] Upsert DNS: name=${name}, target=${endpoint}, type=${recordType}`);
     try {
       // 1. Check if record exists
-      const existing = await CloudflareDNS.getDNSRecord(name, type);
+      const existing = await CloudflareDNS.getDNSRecord(name, recordType);
       if (existing) {
         // Update
-        await CloudflareDNS.updateDNSRecord(existing.id, name, target, type);
-        logger.info(`Updated DNS record for ${name} -> ${target}`);
+        await CloudflareDNS.updateDNSRecord(existing.id, name, endpoint, recordType);
+        logger.info(`Updated DNS record for ${name} -> ${endpoint}`);
       } else {
         // Create
-        await CloudflareDNS.createDNSRecord(name, target, type);
-        logger.info(`Created DNS record for ${name} -> ${target}`);
+        await CloudflareDNS.createDNSRecord(name, endpoint, recordType);
+        logger.info(`Created DNS record for ${name} -> ${endpoint}`);
       }
       return name;
     } catch (err) {

@@ -80,9 +80,10 @@ export class DockerfileGenerator {
    * Generates a Dockerfile for the given project type
    * @param projectType The project type
    * @param repoDir The repository directory
+   * @param port The port to expose (from SQS message or default)
    * @returns true if Dockerfile was generated successfully, false otherwise
    */
-  generateDockerfile(projectType: ProjectType, repoDir: string): boolean {
+  generateDockerfile(projectType: ProjectType, repoDir: string, port: number = 3000): boolean {
     try {
       const dockerfilePath = path.join(repoDir, 'Dockerfile');
       let dockerfileContent = '';
@@ -136,25 +137,25 @@ NEXT_TELEMETRY_DISABLED=1`;
 
       switch (projectType) {
         case ProjectType.NODE_JS:
-          dockerfileContent = this.generateNodeJsDockerfile(repoDir);
+          dockerfileContent = this.generateNodeJsDockerfile(repoDir, port);
           break;
         case ProjectType.PYTHON:
-          dockerfileContent = this.generatePythonDockerfile(repoDir);
+          dockerfileContent = this.generatePythonDockerfile(repoDir, port);
           break;
         case ProjectType.JAVA:
-          dockerfileContent = this.generateJavaDockerfile(repoDir);
+          dockerfileContent = this.generateJavaDockerfile(repoDir, port);
           break;
         case ProjectType.GO:
-          dockerfileContent = this.generateGoDockerfile(repoDir);
+          dockerfileContent = this.generateGoDockerfile(repoDir, port);
           break;
         case ProjectType.PHP:
-          dockerfileContent = this.generatePhpDockerfile(repoDir);
+          dockerfileContent = this.generatePhpDockerfile(repoDir, port);
           break;
         case ProjectType.RUBY:
-          dockerfileContent = this.generateRubyDockerfile(repoDir);
+          dockerfileContent = this.generateRubyDockerfile(repoDir, port);
           break;
         case ProjectType.DOTNET:
-          dockerfileContent = this.generateDotNetDockerfile(repoDir);
+          dockerfileContent = this.generateDotNetDockerfile(repoDir, port);
           break;
         default:
           logger.error('Unknown project type, cannot generate Dockerfile');
@@ -173,9 +174,10 @@ NEXT_TELEMETRY_DISABLED=1`;
   /**
    * Generates a Dockerfile for a Node.js project
    * @param repoDir The repository directory
+   * @param port The port to expose
    * @returns The Dockerfile content
    */
-  private generateNodeJsDockerfile(repoDir: string): string {
+  private generateNodeJsDockerfile(repoDir: string, port: number = 3000): string {
     // Determine if it's a TypeScript project
     const isTypeScript = fs.existsSync(path.join(repoDir, 'tsconfig.json'));
 
@@ -194,254 +196,199 @@ NEXT_TELEMETRY_DISABLED=1`;
     const hasSupabase = this.checkForSupabase(repoDir);
 
     // Determine the start command from package.json
-    let startCommand = 'npm start';
+    let startCommand = '';
+    let fallbackUsed = false;
+    let mainFile = '';
     try {
       const packageJsonPath = path.join(repoDir, 'package.json');
       const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
-      if (packageJson.scripts) {
-        if (packageJson.scripts.start) {
-          if (packageManager === 'yarn') {
-            startCommand = 'yarn start';
-          } else if (packageManager === 'pnpm') {
-            startCommand = 'pnpm start';
-          }
-        } else if (packageJson.scripts.dev) {
-          if (packageManager === 'npm') {
-            startCommand = 'npm run dev';
-          } else if (packageManager === 'yarn') {
-            startCommand = 'yarn dev';
-          } else if (packageManager === 'pnpm') {
-            startCommand = 'pnpm dev';
-          }
+      if (packageJson.scripts && packageJson.scripts.start) {
+        if (packageManager === 'yarn') {
+          startCommand = 'yarn start';
+        } else if (packageManager === 'pnpm') {
+          startCommand = 'pnpm start';
+        } else {
+          startCommand = 'npm start';
         }
-      }
-
-      // Check for main file
-      if (packageJson.main) {
-        const mainFile = packageJson.main;
-        if (mainFile.endsWith('.js')) {
-          startCommand = `node ${mainFile}`;
+      } else if (packageJson.main && packageJson.main.endsWith('.js')) {
+        startCommand = `node ${packageJson.main}`;
+        fallbackUsed = true;
+      } else if (fs.existsSync(path.join(repoDir, 'index.js'))) {
+        startCommand = 'node index.js';
+        fallbackUsed = true;
+      } else if (fs.existsSync(path.join(repoDir, 'app.js'))) {
+        startCommand = 'node app.js';
+        fallbackUsed = true;
+      } else {
+        // Try to find any .js file in root as a last resort
+        const files = fs.readdirSync(repoDir);
+        const jsFile = files.find(f => f.endsWith('.js'));
+        if (jsFile) {
+          startCommand = `node ${jsFile}`;
+          fallbackUsed = true;
+        } else {
+          startCommand = 'node index.js';
+          fallbackUsed = true;
         }
       }
     } catch (error) {
       logger.warn(`Error parsing package.json: ${error}`);
+      if (fs.existsSync(path.join(repoDir, 'index.js'))) {
+        startCommand = 'node index.js';
+      } else if (fs.existsSync(path.join(repoDir, 'app.js'))) {
+        startCommand = 'node app.js';
+      } else {
+        // Try to find any .js file in root as a last resort
+        const files = fs.readdirSync(repoDir);
+        const jsFile = files.find(f => f.endsWith('.js'));
+        if (jsFile) {
+          startCommand = `node ${jsFile}`;
+        } else {
+          startCommand = 'node index.js';
+        }
+      }
+      fallbackUsed = true;
     }
 
     // Generate the Dockerfile
-    let dockerfile = `FROM node:18-alpine
-
-WORKDIR /app
-`;
+    let dockerfile = `FROM node:18-alpine\n\nWORKDIR /app\n`;
 
     // For Prisma projects, we need to copy the prisma directory first
     if (hasPrisma) {
-      dockerfile += `# Copy Prisma schema first
-COPY prisma ./prisma
-
-# Set a placeholder DATABASE_URL for Prisma
-ENV DATABASE_URL="postgresql://postgres:postgres@localhost:5432/postgres?schema=public"
-`;
+      dockerfile += `# Copy Prisma schema first\nCOPY prisma ./prisma\n\n# Set a placeholder DATABASE_URL for Prisma\nENV DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/postgres?schema=public\"\n`;
     }
 
     // Copy package files
-    dockerfile += `COPY package*.json ./
-`;
+    dockerfile += `COPY package*.json ./\n`;
 
     // Add package installation commands based on package manager
     if (packageManager === 'yarn') {
-      dockerfile += `COPY yarn.lock ./
-`;
-
+      dockerfile += `COPY yarn.lock ./\n`;
       if (hasPrisma || hasSupabase) {
-        // For Prisma or Supabase projects, skip postinstall scripts during install
-        dockerfile += `RUN yarn install --ignore-scripts
-`;
-
-        // For Prisma, generate the client separately
+        dockerfile += `RUN yarn install --ignore-scripts\n`;
         if (hasPrisma) {
-          dockerfile += `RUN yarn prisma generate
-`;
+          dockerfile += `RUN yarn prisma generate\n`;
         }
-
-        // For Supabase, set environment variables to skip CLI download
         if (hasSupabase) {
-          dockerfile += `ENV SUPABASE_CLI_VERSION=skip
-`;
+          dockerfile += `ENV SUPABASE_CLI_VERSION=skip\n`;
         }
       } else {
-        dockerfile += `RUN yarn install --frozen-lockfile
-`;
+        dockerfile += `RUN yarn install --frozen-lockfile\n`;
       }
     } else if (packageManager === 'pnpm') {
-      dockerfile += `COPY pnpm-lock.yaml ./
-RUN npm install -g pnpm
-`;
-
+      dockerfile += `COPY pnpm-lock.yaml ./\nRUN npm install -g pnpm\n`;
       if (hasPrisma || hasSupabase) {
-        dockerfile += `RUN pnpm install --ignore-scripts
-`;
-
+        dockerfile += `RUN pnpm install --ignore-scripts\n`;
         if (hasPrisma) {
-          dockerfile += `RUN pnpm prisma generate
-`;
+          dockerfile += `RUN pnpm prisma generate\n`;
         }
-
         if (hasSupabase) {
-          dockerfile += `ENV SUPABASE_CLI_VERSION=skip
-`;
+          dockerfile += `ENV SUPABASE_CLI_VERSION=skip\n`;
         }
       } else {
-        dockerfile += `RUN pnpm install --frozen-lockfile
-`;
+        dockerfile += `RUN pnpm install --frozen-lockfile\n`;
       }
     } else {
       if (hasPrisma || hasSupabase) {
-        dockerfile += `RUN npm install --ignore-scripts
-`;
-
+        dockerfile += `RUN npm install --ignore-scripts\n`;
         if (hasPrisma) {
-          dockerfile += `RUN npx prisma generate
-`;
+          dockerfile += `RUN npx prisma generate\n`;
         }
-
         if (hasSupabase) {
-          dockerfile += `ENV SUPABASE_CLI_VERSION=skip
-`;
+          dockerfile += `ENV SUPABASE_CLI_VERSION=skip\n`;
         }
       } else {
-        // Check if package-lock.json exists
         const hasPackageLock = fs.existsSync(path.join(repoDir, 'package-lock.json'));
-
         if (hasPackageLock) {
-          dockerfile += `RUN npm ci
-`;
+          dockerfile += `RUN npm ci\n`;
         } else {
-          // Use npm install if no package-lock.json is present
-          dockerfile += `RUN npm install
-`;
+          dockerfile += `RUN npm install\n`;
         }
       }
     }
 
-    dockerfile += `
-# Copy the rest of the application
-COPY . .
-`;
+    dockerfile += `\n# Copy the rest of the application\nCOPY . .\n`;
 
-    // Check if the package.json has build and start scripts
+    // Handle build step for different frameworks
     let hasBuildScript = false;
-    let hasStartScript = false;
-
     try {
       const packageJsonPath = path.join(repoDir, 'package.json');
       if (fs.existsSync(packageJsonPath)) {
         const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
         hasBuildScript = packageJson.scripts && packageJson.scripts.build;
-        hasStartScript = packageJson.scripts && packageJson.scripts.start;
       }
-    } catch (error) {
-      logger.error(`Error checking package.json scripts: ${error}`);
-    }
+    } catch {}
 
-    // Handle build step for different frameworks
     if (hasNextJs) {
-      // Next.js specific build with environment variables for PostgreSQL
-      dockerfile += `
-# Set PostgreSQL environment variables for Next.js
-ENV PG_HOST="localhost"
-ENV PG_USER="postgres"
-ENV PG_PASSWORD="postgres"
-ENV PG_DATABASE="postgres"
-ENV PG_PORT="5432"
-ENV DATABASE_URL="postgresql://postgres:postgres@localhost:5432/postgres?schema=public"
-ENV NEXT_PUBLIC_SKIP_API_ROUTES="true"
-ENV NEXT_TELEMETRY_DISABLED="1"
-`;
-
-      // Only add build command if build script exists
+      dockerfile += `\n# Set PostgreSQL environment variables for Next.js\nENV PG_HOST=\"localhost\"\nENV PG_USER=\"postgres\"\nENV PG_PASSWORD=\"postgres\"\nENV PG_DATABASE=\"postgres\"\nENV PG_PORT=\"5432\"\nENV DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/postgres?schema=public\"\nENV NEXT_PUBLIC_SKIP_API_ROUTES=\"true\"\nENV NEXT_TELEMETRY_DISABLED=\"1\"\n`;
       if (hasBuildScript) {
-        dockerfile += `
-# Build with environment variables to skip problematic API routes
-RUN ${packageManager === 'npm' ? 'npm run build' : packageManager === 'yarn' ? 'yarn build' : 'pnpm build'} || echo "Build completed with warnings"
-`;
+        dockerfile += `\n# Build with environment variables to skip problematic API routes\nRUN ${packageManager === 'npm' ? 'npm run build' : packageManager === 'yarn' ? 'yarn build' : 'pnpm build'} || echo \"Build completed with warnings\"\n`;
       }
-
-      dockerfile += `
-EXPOSE 3000
-
-`;
-
-      // Use appropriate start command
-      if (hasStartScript) {
-        dockerfile += `CMD ["${packageManager === 'npm' ? 'npm' : packageManager} run", "start"]`;
-      } else {
-        dockerfile += `CMD ["node", "index.js"]`;
-      }
+      dockerfile += `\nEXPOSE ${port}\n`;
     } else if (hasNuxt) {
-      // Nuxt.js specific build
       if (hasBuildScript) {
-        dockerfile += `
-RUN ${packageManager === 'npm' ? 'npm run build' : packageManager === 'yarn' ? 'yarn build' : 'pnpm build'} || echo "Build completed with warnings"
-`;
+        dockerfile += `\nRUN ${packageManager === 'npm' ? 'npm run build' : packageManager === 'yarn' ? 'yarn build' : 'pnpm build'} || echo \"Build completed with warnings\"\n`;
       }
-
-      dockerfile += `
-EXPOSE 3000
-
-`;
-
-      // Use appropriate start command
-      if (hasStartScript) {
-        dockerfile += `CMD ["${packageManager === 'npm' ? 'npm' : packageManager} run", "start"]`;
-      } else {
-        dockerfile += `CMD ["node", "index.js"]`;
-      }
+      dockerfile += `\nEXPOSE ${port}\n`;
     } else if (isTypeScript) {
-      // Generic TypeScript build
       if (hasBuildScript) {
-        dockerfile += `
-RUN ${packageManager === 'npm' ? 'npm run build' : packageManager === 'yarn' ? 'yarn build' : 'pnpm build'} || echo "Build completed with warnings"
-`;
+        dockerfile += `\nRUN ${packageManager === 'npm' ? 'npm run build' : packageManager === 'yarn' ? 'yarn build' : 'pnpm build'} || echo \"Build completed with warnings\"\n`;
       }
-
-      dockerfile += `
-EXPOSE 3000
-
-CMD ["${startCommand.split(' ')[0]}"`;
-
-      // Add arguments if any
-      const args = startCommand.split(' ').slice(1);
-      if (args.length > 0) {
-        dockerfile += `, "${args.join('", "')}"]`;
-      } else {
-        dockerfile += `]`;
-      }
+      dockerfile += `\nEXPOSE ${port}\n`;
     } else {
-      // Generic Node.js
-      dockerfile += `
-EXPOSE 3000
-
-CMD ["${startCommand.split(' ')[0]}"`;
-
-      // Add arguments if any
-      const args = startCommand.split(' ').slice(1);
-      if (args.length > 0) {
-        dockerfile += `, "${args.join('", "')}"]`;
-      } else {
-        dockerfile += `]`;
-      }
+      dockerfile += `\nEXPOSE ${port}\n`;
     }
 
+    // Compose environment variables for CMD
+    let envVars = '';
+    let exposePort = port;
+    try {
+      // Try to load environment variables from metadata/environmentValues.json if present
+      const envPath = path.join(repoDir, 'environmentValues.json');
+      let envObj: Record<string, string> = {};
+      if (fs.existsSync(envPath)) {
+        envObj = JSON.parse(fs.readFileSync(envPath, 'utf8'));
+      }
+      // If not, try to get from process.env (for test) or fallback to empty
+      if (Object.keys(envObj).length === 0 && process.env._DEPLOY_ENV_VALUES) {
+        try {
+          envObj = JSON.parse(process.env._DEPLOY_ENV_VALUES);
+        } catch {}
+      }
+      // If PORT is present in env, use it for EXPOSE and CMD
+      if (envObj.PORT && !isNaN(Number(envObj.PORT))) {
+        exposePort = Number(envObj.PORT);
+      }
+      if (Object.keys(envObj).length > 0) {
+        envVars = Object.entries(envObj)
+          .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+          .join(' ');
+      }
+    } catch {}
+    // Always use shell form for CMD with all envVars inline for Node.js
+    dockerfile += `\nEXPOSE ${exposePort}\n`;
+    if (fallbackUsed) {
+      dockerfile += `\n# WARNING: No \"start\" script found in package.json. Using fallback: ${startCommand}\n`;
+    }
+    if (envVars) {
+      // Use shell form for CMD with env vars inline
+      dockerfile += `\nCMD ${envVars} ${startCommand}`;
+    } else {
+      // Use exec form if no env vars
+      const cmdParts = startCommand.split(' ');
+      dockerfile += `\nCMD [${cmdParts.map(s => `\"${s}\"`).join(', ')}]`;
+    }
     return dockerfile;
   }
 
   /**
    * Generates a Dockerfile for a Python project
    * @param repoDir The repository directory
+   * @param port The port to expose
    * @returns The Dockerfile content
    */
-  private generatePythonDockerfile(repoDir: string): string {
+  private generatePythonDockerfile(repoDir: string, port: number = 8000): string {
     // Determine if it's a Django project
     const isDjango = fs.existsSync(path.join(repoDir, 'manage.py'));
 
@@ -464,6 +411,18 @@ CMD ["${startCommand.split(' ')[0]}"`;
 
     // Determine the Python version
     let pythonVersion = '3.9';
+
+    // Check for environment variables to determine the port
+    let exposePort = port;
+    try {
+      const envPath = path.join(repoDir, 'environmentValues.json');
+      if (fs.existsSync(envPath)) {
+        const envObj = JSON.parse(fs.readFileSync(envPath, 'utf8'));
+        if (envObj.PORT && !isNaN(Number(envObj.PORT))) {
+          exposePort = Number(envObj.PORT);
+        }
+      }
+    } catch {}
 
     // Generate the Dockerfile
     let dockerfile = `FROM python:${pythonVersion}-slim
@@ -491,14 +450,14 @@ RUN pip install --no-cache-dir -e .
 
     dockerfile += `COPY . .
 
-EXPOSE 8000
+EXPOSE ${exposePort}
 
 `;
 
     if (isDjango) {
-      dockerfile += `CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]`;
+      dockerfile += `CMD ["python", "manage.py", "runserver", "0.0.0.0:${exposePort}"]`;
     } else if (isFlask) {
-      dockerfile += `CMD ["flask", "run", "--host=0.0.0.0", "--port=8000"]`;
+      dockerfile += `CMD ["flask", "run", "--host=0.0.0.0", "--port=${exposePort}"]`;
     } else {
       dockerfile += `CMD ["python", "app.py"]`;
     }
@@ -509,9 +468,10 @@ EXPOSE 8000
   /**
    * Generates a Dockerfile for a Java project
    * @param repoDir The repository directory
+   * @param port The port to expose
    * @returns The Dockerfile content
    */
-  private generateJavaDockerfile(repoDir: string): string {
+  private generateJavaDockerfile(repoDir: string, port: number = 8080): string {
     // Determine if it's a Maven or Gradle project
     const isMaven = fs.existsSync(path.join(repoDir, 'pom.xml'));
 
@@ -534,7 +494,7 @@ WORKDIR /app
 
 COPY --from=build /app/target/*.jar app.jar
 
-EXPOSE 8080
+EXPOSE ${port}
 
 CMD ["java", "-jar", "app.jar"]`;
     } else {
@@ -553,7 +513,7 @@ WORKDIR /app
 
 COPY --from=build /app/build/libs/*.jar app.jar
 
-EXPOSE 8080
+EXPOSE ${port}
 
 CMD ["java", "-jar", "app.jar"]`;
     }
@@ -564,9 +524,10 @@ CMD ["java", "-jar", "app.jar"]`;
   /**
    * Generates a Dockerfile for a Go project
    * @param repoDir The repository directory
+   * @param port The port to expose
    * @returns The Dockerfile content
    */
-  private generateGoDockerfile(repoDir: string): string {
+  private generateGoDockerfile(repoDir: string, port: number = 8080): string {
     return `FROM golang:1.20-alpine AS build
 
 WORKDIR /app
@@ -584,7 +545,7 @@ WORKDIR /app
 
 COPY --from=build /app/server .
 
-EXPOSE 8080
+EXPOSE ${port}
 
 CMD ["./server"]`;
   }
@@ -592,9 +553,10 @@ CMD ["./server"]`;
   /**
    * Generates a Dockerfile for a PHP project
    * @param repoDir The repository directory
+   * @param port The port to expose
    * @returns The Dockerfile content
    */
-  private generatePhpDockerfile(repoDir: string): string {
+  private generatePhpDockerfile(repoDir: string, port: number = 80): string {
     // Determine if it's a Laravel project
     const isLaravel = fs.existsSync(path.join(repoDir, 'artisan'));
 
@@ -625,7 +587,7 @@ RUN composer dump-autoload --optimize
 
 RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
 
-EXPOSE 9000
+EXPOSE ${port}
 
 CMD ["php-fpm"]`;
     } else {
@@ -643,7 +605,7 @@ COPY . .
 
 RUN chown -R www-data:www-data /var/www/html
 
-EXPOSE 80
+EXPOSE ${port}
 
 CMD ["apache2-foreground"]`;
     }
@@ -652,9 +614,10 @@ CMD ["apache2-foreground"]`;
   /**
    * Generates a Dockerfile for a Ruby project
    * @param repoDir The repository directory
+   * @param port The port to expose
    * @returns The Dockerfile content
    */
-  private generateRubyDockerfile(repoDir: string): string {
+  private generateRubyDockerfile(repoDir: string, port: number = 3000): string {
     // Determine if it's a Rails project
     const isRails = fs.existsSync(path.join(repoDir, 'config', 'application.rb'));
 
@@ -668,7 +631,7 @@ RUN bundle install
 
 COPY . .
 
-EXPOSE 3000
+EXPOSE ${port}
 
 CMD ["rails", "server", "-b", "0.0.0.0"]`;
     } else {
@@ -681,7 +644,7 @@ RUN bundle install
 
 COPY . .
 
-EXPOSE 4567
+EXPOSE ${port}
 
 CMD ["ruby", "app.rb"]`;
     }
@@ -690,9 +653,10 @@ CMD ["ruby", "app.rb"]`;
   /**
    * Generates a Dockerfile for a .NET project
    * @param repoDir The repository directory
+   * @param port The port to expose
    * @returns The Dockerfile content
    */
-  private generateDotNetDockerfile(repoDir: string): string {
+  private generateDotNetDockerfile(repoDir: string, port: number = 80): string {
     return `FROM mcr.microsoft.com/dotnet/sdk:7.0 AS build
 
 WORKDIR /app
@@ -710,7 +674,7 @@ WORKDIR /app
 
 COPY --from=build /app/out .
 
-EXPOSE 80
+EXPOSE ${port}
 
 ENTRYPOINT ["dotnet", "app.dll"]`;
   }

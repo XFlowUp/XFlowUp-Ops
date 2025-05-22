@@ -142,6 +142,9 @@ export class DeploymentManager {
       }
       // --- END: Add retries for fetching public endpoint ---
       let assignedUrl: string | undefined;
+      let isAccessible = false;
+      let status: DeploymentStatus = DeploymentStatus.FAILED;
+      let errorMsg: any = undefined;
       if (success && publicEndpoint) {
         // Assign random subdomain via Cloudflare
         const domain = process.env.DOMAIN || 'your-domain.com';
@@ -153,13 +156,12 @@ export class DeploymentManager {
         logger.info(`[CloudFlare DNS] Generated random subdomain: ${randomSubdomain}`);
         await streamLog(`[CloudFlare DNS] Generated random subdomain: ${randomSubdomain}`);
 
-        logger.info(`[CloudFlare DNS] Attempting to link ECS to CloudFlare DNS with CNAME record: ${randomSubdomain}.${domain} -> ${publicEndpoint}`);
-        await streamLog(`[CloudFlare DNS] Attempting to link ECS to CloudFlare DNS with CNAME record: ${randomSubdomain}.${domain} -> ${publicEndpoint}`);
+        logger.info(`[CloudFlare DNS] Attempting to link ECS to CloudFlare DNS: ${randomSubdomain}.${domain} -> ${publicEndpoint}`);
+        await streamLog(`[CloudFlare DNS] Attempting to link ECS to CloudFlare DNS: ${randomSubdomain}.${domain} -> ${publicEndpoint}`);
         try {
-          logger.info(`[CloudFlare DNS] Calling upsertDNSRecord with params: subdomain=${randomSubdomain}, domain=${domain}, endpoint=${publicEndpoint}, type=CNAME`);
-          await streamLog(`[CloudFlare DNS] Calling upsertDNSRecord with params: subdomain=${randomSubdomain}, domain=${domain}, endpoint=${publicEndpoint}, type=CNAME`);
-          const urlResult = await CloudflareDNS.upsertDNSRecord(randomSubdomain, domain, publicEndpoint, 'CNAME');
-
+          logger.info(`[CloudFlare DNS] Calling upsertDNSRecord with params: subdomain=${randomSubdomain}, domain=${domain}, endpoint=${publicEndpoint}`);
+          await streamLog(`[CloudFlare DNS] Calling upsertDNSRecord with params: subdomain=${randomSubdomain}, domain=${domain}, endpoint=${publicEndpoint}`);
+          const urlResult = await CloudflareDNS.upsertDNSRecord(randomSubdomain, domain, publicEndpoint);
           if (urlResult) {
             assignedUrl = urlResult;
             logger.info(`[CloudFlare DNS] Successfully linked ECS to CloudFlare DNS. Assigned URL: ${assignedUrl} -> ${publicEndpoint}`);
@@ -171,24 +173,32 @@ export class DeploymentManager {
           }
 
           // Verify the site is live
-          let isAccessible = false;
           if (assignedUrl) {
+            // Do not append port to the URL, always use http://assignedUrl
             const urlToCheck = `http://${assignedUrl}`;
             logger.info(`[CloudFlare DNS] Verifying site accessibility at: ${urlToCheck}`);
             await streamLog(`[CloudFlare DNS] Verifying site accessibility at: ${urlToCheck}`);
-            try {
-              logger.info(`[CloudFlare DNS] Sending GET request to ${urlToCheck} with 10s timeout`);
-              await streamLog(`[CloudFlare DNS] Sending GET request to ${urlToCheck} with 10s timeout`);
-              await axios.get(urlToCheck, { timeout: 10000 });
-              logger.info(`[CloudFlare DNS] Health check PASSED: Site is live at ${urlToCheck}`);
-              await streamLog(`[CloudFlare DNS] Health check PASSED: Site is live at ${urlToCheck}`);
-              isAccessible = true;
-            } catch (err) {
-              logger.warn(`[CloudFlare DNS] Health check FAILED: Could not verify site is live at ${urlToCheck}`);
-              await streamLog(`[CloudFlare DNS] Health check FAILED: Could not verify site is live at ${urlToCheck}`);
-              logger.warn(`[CloudFlare DNS] Health check error details: ${err}`);
-              await streamLog(`[CloudFlare DNS] Health check error details: ${err}`);
-              // We'll still continue and send the status message, but mark it as not accessible
+            // Add retry logic for health check
+            const maxHealthRetries = 10;
+            const healthRetryDelay = 10000; // 5 seconds
+            for (let attempt = 1; attempt <= maxHealthRetries; attempt++) {
+              try {
+                logger.info(`[CloudFlare DNS] Health check attempt ${attempt}: Sending GET request to ${urlToCheck} with 10s timeout`);
+                await streamLog(`[CloudFlare DNS] Health check attempt ${attempt}: Sending GET request to ${urlToCheck} with 10s timeout`);
+                await axios.get(urlToCheck, { timeout: 10000 });
+                logger.info(`[CloudFlare DNS] Health check PASSED: Site is live at ${urlToCheck}`);
+                await streamLog(`[CloudFlare DNS] Health check PASSED: Site is live at ${urlToCheck}`);
+                isAccessible = true;
+                break;
+              } catch (err) {
+                logger.warn(`[CloudFlare DNS] Health check attempt ${attempt} FAILED: Could not verify site is live at ${urlToCheck}`);
+                await streamLog(`[CloudFlare DNS] Health check attempt ${attempt} FAILED: Could not verify site is live at ${urlToCheck}`);
+                logger.warn(`[CloudFlare DNS] Health check error details: ${err}`);
+                await streamLog(`[CloudFlare DNS] Health check error details: ${err}`);
+                if (attempt < maxHealthRetries) {
+                  await new Promise(res => setTimeout(res, healthRetryDelay));
+                }
+              }
             }
           } else {
             logger.warn(`[CloudFlare DNS] Skipping health check because no URL was assigned`);
@@ -267,6 +277,7 @@ export class DeploymentManager {
           logger.error(`[CloudFlare DNS] Deployment may have succeeded but DNS linking failed. Check CloudFlare settings and API access.`);
           await streamLog(`[CloudFlare DNS] Deployment may have succeeded but DNS linking failed. Check CloudFlare settings and API access.`);
         }
+        status = isAccessible ? DeploymentStatus.COMPLETED : DeploymentStatus.FAILED;
       } else {
         logger.info(`[CloudFlare DNS] Skipping CloudFlare DNS linking because either deployment was not successful or no public endpoint was available`);
         await streamLog(`[CloudFlare DNS] Skipping CloudFlare DNS linking because either deployment was not successful or no public endpoint was available`);
@@ -278,24 +289,15 @@ export class DeploymentManager {
           logger.error(`[CloudFlare DNS] No public endpoint available for service ID: ${payload.serviceId}`);
           await streamLog(`[CloudFlare DNS] No public endpoint available for service ID: ${payload.serviceId}`);
         }
+        status = DeploymentStatus.FAILED;
       }
-
-      // Update deployment status based on result
-      if (!success) {
-        logger.error(`[CloudFlare DNS] Deployment failed for service ID: ${payload.serviceId}. Updating status to FAILED.`);
-        await streamLog(`[CloudFlare DNS] Deployment failed for service ID: ${payload.serviceId}. Updating status to FAILED.`);
-        if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
-          logger.info(`[CloudFlare DNS] Sending FAILED status update for service ID: ${payload.serviceId}`);
-          await streamLog(`[CloudFlare DNS] Sending FAILED status update for service ID: ${payload.serviceId}`);
-          await this.updateDeploymentStatus(payload, DeploymentStatus.FAILED);
-          logger.info(`[CloudFlare DNS] Successfully sent FAILED status update for service ID: ${payload.serviceId}`);
-          await streamLog(`[CloudFlare DNS] Successfully sent FAILED status update for service ID: ${payload.serviceId}`);
-        } else {
-          logger.info('[CloudFlare DNS] Skipping SQS deployment status update (FAILED) due to SKIP_DEPLOYMENT_STATUS_SQS=true');
-          await streamLog('[CloudFlare DNS] Skipping SQS deployment status update (FAILED) due to SKIP_DEPLOYMENT_STATUS_SQS=true');
-        }
-        logger.error(`[CloudFlare DNS] Deployment failed for service ID: ${payload.serviceId}. No further actions will be taken.`);
-        await streamLog(`[CloudFlare DNS] Deployment failed for service ID: ${payload.serviceId}. No further actions will be taken.`);
+      // Always send status update at the end
+      if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
+        logger.info(`[CloudFlare DNS] Sending final status update (${status}) for service ID: ${payload.serviceId}`);
+        await streamLog(`[CloudFlare DNS] Sending final status update (${status}) for service ID: ${payload.serviceId}`);
+        await this.updateDeploymentStatus({ ...payload, deploymentUrl: assignedUrl, isAccessible }, status, errorMsg);
+        logger.info(`[CloudFlare DNS] Successfully sent final status update (${status}) for service ID: ${payload.serviceId}`);
+        await streamLog(`[CloudFlare DNS] Successfully sent final status update (${status}) for service ID: ${payload.serviceId}`);
       }
     } catch (error) {
       logger.error(`[CloudFlare DNS] Unhandled error during deployment process: ${error}`);
@@ -304,18 +306,13 @@ export class DeploymentManager {
       await streamLog(`[CloudFlare DNS] Error details: ${error}`);
       logger.error(`[CloudFlare DNS] This is a critical error that occurred during the deployment process for service ID: ${payload.serviceId}`);
       await streamLog(`[CloudFlare DNS] This is a critical error that occurred during the deployment process for service ID: ${payload.serviceId}`);
-
       if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
         logger.info(`[CloudFlare DNS] Sending FAILED status update with error details for service ID: ${payload.serviceId}`);
         await streamLog(`[CloudFlare DNS] Sending FAILED status update with error details for service ID: ${payload.serviceId}`);
         await this.updateDeploymentStatus(payload, DeploymentStatus.FAILED, error);
         logger.info(`[CloudFlare DNS] Successfully sent FAILED status update with error details for service ID: ${payload.serviceId}`);
         await streamLog(`[CloudFlare DNS] Successfully sent FAILED status update with error details for service ID: ${payload.serviceId}`);
-      } else {
-        logger.info('[CloudFlare DNS] Skipping SQS deployment status update (FAILED, error) due to SKIP_DEPLOYMENT_STATUS_SQS=true');
-        await streamLog('[CloudFlare DNS] Skipping SQS deployment status update (FAILED, error) due to SKIP_DEPLOYMENT_STATUS_SQS=true');
       }
-
       logger.error(`[CloudFlare DNS] Deployment process terminated with errors for service ID: ${payload.serviceId}`);
       await streamLog(`[CloudFlare DNS] Deployment process terminated with errors for service ID: ${payload.serviceId}`);
     }

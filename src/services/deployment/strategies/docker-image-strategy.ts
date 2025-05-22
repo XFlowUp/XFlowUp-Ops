@@ -35,8 +35,10 @@ export class DockerImageStrategy implements DeploymentStrategy {
       const serviceName = `${payload.projectSlug}-${payload.serviceId}`;
       const environmentVariables = payload.metadata?.environmentValues || {};
       let containerPort = 3000;
-      if (payload.containerPort) {
-        containerPort = payload.containerPort;
+      if (payload.port && !isNaN(Number(payload.port))) {
+        containerPort = Number(payload.port);
+      } else if (payload.containerPort && !isNaN(Number(payload.containerPort))) {
+        containerPort = Number(payload.containerPort);
       } else if (environmentVariables.PORT && !isNaN(Number(environmentVariables.PORT))) {
         containerPort = Number(environmentVariables.PORT);
       }

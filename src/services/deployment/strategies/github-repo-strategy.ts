@@ -61,9 +61,21 @@ export class GithubRepoStrategy implements DeploymentStrategy {
           // TODO: metrics: increment github_deploy_failed
           throw new Error('Unable to determine project type. Cannot generate Dockerfile.');
         }
-        logger.info(`[context] Detected project type: ${projectType}`, context);
-        // Generate Dockerfile
-        const success = this.dockerfileGenerator.generateDockerfile(projectType, repoDir);
+        logger.info(`[context] Detected project type: ${projectType}`, context);        // Determine port from payload - prioritize environmentValues.PORT over top-level port
+        let dockerPort = 3000;
+        if (payload.metadata?.environmentValues?.PORT && !isNaN(Number(payload.metadata.environmentValues.PORT))) {
+          dockerPort = Number(payload.metadata.environmentValues.PORT);
+        } else if (payload.containerPort && !isNaN(Number(payload.containerPort))) {
+          dockerPort = Number(payload.containerPort);
+        } else if (payload.port && !isNaN(Number(payload.port))) {
+          dockerPort = Number(payload.port);        }
+        // Write environment variables to file for Dockerfile generator
+        if (payload.metadata?.environmentValues) {
+          const envFilePath = path.join(repoDir, 'environmentValues.json');
+          fs.writeFileSync(envFilePath, JSON.stringify(payload.metadata.environmentValues, null, 2));
+        }
+        // Generate Dockerfile with correct port
+        const success = this.dockerfileGenerator.generateDockerfile(projectType, repoDir, dockerPort);
         if (!success) {
           logger.error(`[context] Failed to generate Dockerfile for ${projectType} project.`, context);
           // TODO: metrics: increment github_deploy_failed
@@ -82,10 +94,13 @@ export class GithubRepoStrategy implements DeploymentStrategy {
         // TODO: metrics: increment docker_build_success
         // Create or update ECS service
         const serviceName = `${payload.projectSlug}-${payload.serviceId}`;
-        const environmentVariables = payload.metadata?.environmentValues || {};
-        let containerPort = 3000;
-        if (payload.containerPort) {
-          containerPort = payload.containerPort;
+        const environmentVariables = payload.metadata?.environmentValues || {};        let containerPort = 3000;
+        if (payload.metadata?.environmentValues?.PORT && !isNaN(Number(payload.metadata.environmentValues.PORT))) {
+          containerPort = Number(payload.metadata.environmentValues.PORT);
+        } else if (payload.containerPort && !isNaN(Number(payload.containerPort))) {
+          containerPort = Number(payload.containerPort);
+        } else if (payload.port && !isNaN(Number(payload.port))) {
+          containerPort = Number(payload.port);
         } else if (environmentVariables.PORT && !isNaN(Number(environmentVariables.PORT))) {
           containerPort = Number(environmentVariables.PORT);
         }

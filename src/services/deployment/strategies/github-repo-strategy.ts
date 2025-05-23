@@ -21,11 +21,11 @@ export class GithubRepoStrategy implements DeploymentStrategy {
     this.dockerfileGenerator = new DockerfileGenerator();
   }
 
-  async deploy(payload: DeploymentRequestPayload): Promise<boolean> {
+  async deploy(payload: DeploymentRequestPayload, deploymentId?: string): Promise<boolean> {
     const context = {
       serviceId: payload.serviceId,
       projectSlug: payload.projectSlug,
-      deploymentId: payload.messageId || payload.deploymentId || undefined,
+      deploymentId: deploymentId || payload.deploymentId || payload.messageId || undefined,
       type: payload.type
     };
     logger.info(`[context] Starting GitHub repo deployment`, context);
@@ -61,14 +61,18 @@ export class GithubRepoStrategy implements DeploymentStrategy {
           // TODO: metrics: increment github_deploy_failed
           throw new Error('Unable to determine project type. Cannot generate Dockerfile.');
         }
-        logger.info(`[context] Detected project type: ${projectType}`, context);        // Determine port from payload - prioritize environmentValues.PORT over top-level port
+        logger.info(`[context] Detected project type: ${projectType}`, context);
+        
+        // Determine port from payload - prioritize environmentValues.PORT over top-level port
         let dockerPort = 3000;
+        
         if (payload.metadata?.environmentValues?.PORT && !isNaN(Number(payload.metadata.environmentValues.PORT))) {
           dockerPort = Number(payload.metadata.environmentValues.PORT);
         } else if (payload.containerPort && !isNaN(Number(payload.containerPort))) {
           dockerPort = Number(payload.containerPort);
         } else if (payload.port && !isNaN(Number(payload.port))) {
-          dockerPort = Number(payload.port);        }
+          dockerPort = Number(payload.port);
+        }
         // Write environment variables to file for Dockerfile generator
         if (payload.metadata?.environmentValues) {
           const envFilePath = path.join(repoDir, 'environmentValues.json');
@@ -92,9 +96,11 @@ export class GithubRepoStrategy implements DeploymentStrategy {
         const imageUri = await this.ecrService.buildAndPushImage(repoDir, imageTag);
         logger.info(`[context] Docker image built and pushed: ${imageUri}`, context);
         // TODO: metrics: increment docker_build_success
+        
         // Create or update ECS service
         const serviceName = `${payload.projectSlug}-${payload.serviceId}`;
-        const environmentVariables = payload.metadata?.environmentValues || {};        let containerPort = 3000;
+        const environmentVariables = payload.metadata?.environmentValues || {};
+        let containerPort = 3000;
         if (payload.metadata?.environmentValues?.PORT && !isNaN(Number(payload.metadata.environmentValues.PORT))) {
           containerPort = Number(payload.metadata.environmentValues.PORT);
         } else if (payload.containerPort && !isNaN(Number(payload.containerPort))) {
@@ -104,14 +110,22 @@ export class GithubRepoStrategy implements DeploymentStrategy {
         } else if (environmentVariables.PORT && !isNaN(Number(environmentVariables.PORT))) {
           containerPort = Number(environmentVariables.PORT);
         }
+        
         logger.info(`[context] Deploying to ECS: ${serviceName} on port ${containerPort}`, context);
-        // TODO: metrics: increment ecs_deploy_started
+        // TODO: metrics: increment ecs_deploy_started        // Ensure we have a valid deploymentId
+        const effectiveDeploymentId = payload.deploymentId || context.deploymentId || `manual-deploy-${Date.now()}`;
+        logger.info(`[context] Using deployment ID for CloudWatch logs: ${effectiveDeploymentId}`, context);
+        
         const ecsResult = await this.ecsService.deployService(
           serviceName,
           imageUri,
           environmentVariables,
-          containerPort
+          containerPort,
+          undefined, // customDomain
+          undefined, // healthCheckPath
+          effectiveDeploymentId
         );
+        
         logger.info(`[context] ECS deployment result: ${JSON.stringify(ecsResult)}`, context);
         // TODO: metrics: increment ecs_deploy_success if ecsResult.healthy
         this.lastPublicEndpoint = ecsResult.publicEndpoint;

@@ -57,20 +57,17 @@ export class DeploymentManager {
     this.strategies.set(ServiceType.DOCKER_IMAGE, new DockerImageStrategy());
     // Add more strategies as needed
   }
-
   async handleDeploymentRequest(payload: DeploymentRequestPayload): Promise<void> {
-    logger.info(`Handling deployment request for service type: ${payload.type}`);
-    // --- BEGIN: CloudWatch log streaming setup ---
-    const buildId = `build-${payload.serviceId}-${Date.now()}`;
-    const logGroupName = 'ecs/log-builder';
-    const logStreamName = buildId;
+    logger.info(`Handling deployment request for service type: ${payload.type}`);    // --- BEGIN: CloudWatch log streaming setup ---
+    const deploymentId = (payload as any).deploymentId || `fallback-${payload.serviceId}-${Date.now()}`;
+    const logGroupName = '/ecs/log-builder';
+    const logStreamName = deploymentId;
     this.cloudWatchLogger = new CloudWatchStreamLogger(logGroupName, logStreamName);
-    await this.cloudWatchLogger.init();
-    const streamLog = async (msg: string) => {
+    await this.cloudWatchLogger.init();const streamLog = async (msg: string) => {
       logger.info(`[STREAM_LOG] ${msg}`);
       await this.cloudWatchLogger?.putLog(msg);
     };
-    await streamLog(`Deployment started for service type: ${payload.type}, buildId: ${buildId}`);
+    await streamLog(`Deployment started for service type: ${payload.type}, deploymentId: ${deploymentId}`);
     // --- END: CloudWatch log streaming setup ---
     // Log the full deployment payload for debugging
     logger.info(`Full deployment payload: ${JSON.stringify(payload)}`);
@@ -111,7 +108,24 @@ export class DeploymentManager {
       }
 
       // Execute the deployment
-      const success = await strategy.deploy(payload);
+      const deployResult = await strategy.deploy(payload);
+      let success: boolean = false;
+      let logStreamName: string | undefined;
+      // Type guard for deployResult
+      if (typeof deployResult === 'object' && deployResult !== null) {
+        if ('healthy' in deployResult) {
+          success = !!(deployResult as any).healthy;
+        } else if ('success' in deployResult) {
+          success = !!(deployResult as any).success;
+        } else {
+          success = !!deployResult;
+        }
+        if ('logStreamName' in deployResult) {
+          logStreamName = (deployResult as any).logStreamName;
+        }
+      } else {
+        success = !!deployResult;
+      }
       await streamLog(`Strategy.deploy returned: ${success}`);
       let publicEndpoint: string | undefined;
       // --- BEGIN: Add retries for fetching public endpoint ---
@@ -234,17 +248,16 @@ export class DeploymentManager {
             await streamLog(`[CloudFlare DNS] Deployment completed successfully for service ID: ${payload.serviceId}`);
 
             // Send SQS message with deployment URL, status, and project info
-            if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
-              const sqsMessage = {
+            if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {              const sqsMessage = {
                 serviceId: payload.serviceId,
                 projectSlug: payload.projectSlug,
                 status: DeploymentStatus.COMPLETED,
                 deploymentUrl: assignedUrl, // Ensure random url is included
                 publicEndpoint,
                 isAccessible: true,
-                buildId, // Include buildId for backend tracking
+                deploymentId, // Include deploymentId for backend tracking
                 logGroupName,
-                logStreamName,
+                logStreamName, // <-- include the full log stream name
                 timestamp: new Date().toISOString(),
                 originalMessage: payload
               };
@@ -299,7 +312,7 @@ export class DeploymentManager {
       if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
         logger.info(`[CloudFlare DNS] Sending final status update (${status}) for service ID: ${payload.serviceId}`);
         await streamLog(`[CloudFlare DNS] Sending final status update (${status}) for service ID: ${payload.serviceId}`);
-        await this.updateDeploymentStatus({ ...payload, deploymentUrl: assignedUrl, isAccessible }, status, errorMsg);
+        await this.updateDeploymentStatus({ ...payload, deploymentUrl: assignedUrl, isAccessible, logStreamName }, status, errorMsg);
         logger.info(`[CloudFlare DNS] Successfully sent final status update (${status}) for service ID: ${payload.serviceId}`);
         await streamLog(`[CloudFlare DNS] Successfully sent final status update (${status}) for service ID: ${payload.serviceId}`);
       }

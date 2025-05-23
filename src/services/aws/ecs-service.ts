@@ -6,7 +6,9 @@ import {
   DescribeServicesCommand,
   RegisterTaskDefinitionCommand,
   ContainerDefinition,
-  KeyValuePair
+  KeyValuePair,
+  ListTasksCommand,
+  DescribeTasksCommand
 } from '@aws-sdk/client-ecs';
 import { IAM, GetRoleCommand } from '@aws-sdk/client-iam';
 import { ElasticLoadBalancingV2 } from '@aws-sdk/client-elastic-load-balancing-v2';
@@ -142,28 +144,27 @@ export class ECSService {
    * @param containerPort
    * @param customDomain (optional) - full domain to link, e.g. app.example.com
    * @param healthCheckPath (optional) - health check path
-   */
-  async deployService(
+   */  async deployService(
     serviceName: string,
     imageUri: string,
     environmentVariables: Record<string, string> = {},
     containerPort?: number,
     customDomain?: string,
-    healthCheckPath?: string // Optional health check path
-  ): Promise<{ serviceName: string; publicEndpoint?: string; healthy: boolean; healthError?: string; customDomainUrl?: string }> {
-    let publicEndpoint: string | undefined; // Define at a scope accessible by the final return and health check
-
+    healthCheckPath?: string, // Optional health check path
+    deploymentId?: string // Added deploymentId parameter
+  ): Promise<{ serviceName: string; publicEndpoint?: string; healthy: boolean; healthError?: string; customDomainUrl?: string; logStreamName?: string }> {
+    let publicEndpoint: string | undefined;
+    let logStreamName: string | undefined;
     try {
       logger.info(`Deploying ECS service: ${serviceName} with image: ${imageUri}`);
-      const port = containerPort || 3000;
-
-      // Register task definition outside the inner try block so it's available in the catch block
+      const port = containerPort || 3000;      // Register task definition outside the inner try block so it's available in the catch block
       logger.info(`Registering task definition for service: ${serviceName}`);
       const taskDefinitionArn = await this.registerTaskDefinition(
         serviceName,
         imageUri,
         environmentVariables,
-        port
+        port,
+        deploymentId
       );
       logger.info(`Task definition registered with ARN: ${taskDefinitionArn}`);
 
@@ -244,11 +245,20 @@ export class ECSService {
         logger.error(`ALB DNS (publicEndpoint) was not set after service create/update for ${serviceName}. This indicates an issue in the deployment flow.`);
         return { serviceName, healthy: false, healthError: 'Failed to obtain ALB DNS during deployment.', publicEndpoint: undefined };
       }
-      
       // Health check logic
       const { healthy, healthError } = await this.waitForServiceHealthy(serviceName, publicEndpoint, healthCheckPath);
       if (!healthy) {
         logger.error(`ECS service ${serviceName} is not healthy: ${healthError}`);
+      }
+      // Fetch running task ID to construct log stream name
+      try {
+        const taskId = await this.getRunningTaskId(serviceName);
+        if (taskId) {
+          const streamPrefix = deploymentId || serviceName;
+          logStreamName = `${streamPrefix}/${serviceName}/${taskId}`;
+        }
+      } catch (err) {
+        logger.warn(`Could not fetch ECS task ID for log stream name: ${err}`);
       }
       // Link custom domain if provided and public endpoint is available
       let customDomainUrl: string | undefined = undefined;
@@ -262,18 +272,39 @@ export class ECSService {
           logger.warn(`Failed to link custom domain ${customDomain}`);
         }
       }
-      return { serviceName, publicEndpoint, healthy, healthError, customDomainUrl };
-    } catch (error) { // Outer catch
+      return { serviceName, publicEndpoint, healthy, healthError, customDomainUrl, logStreamName };
+    } catch (error) {
       logger.error(`Failed to deploy service: ${error}`);
-      throw error; // Rethrow to be handled by the caller strategy
+      throw error;
     }
+  }
+
+  // Helper to get the running ECS task ID for a service
+  private async getRunningTaskId(serviceName: string): Promise<string | undefined> {
+    try {
+      const listTasksRes = await this.ecs.send(new ListTasksCommand({
+        cluster: this.cluster,
+        serviceName,
+        desiredStatus: 'RUNNING',
+        maxResults: 1
+      }));
+      if (listTasksRes.taskArns && listTasksRes.taskArns.length > 0) {
+        const taskArn = listTasksRes.taskArns[0];
+        const taskId = taskArn.split('/').pop();
+        return taskId;
+      }
+    } catch (err) {
+      logger.warn(`Error fetching running ECS task ID: ${err}`);
+    }
+    return undefined;
   }
 
   private async registerTaskDefinition(
     serviceName: string,
     imageUri: string,
     environmentVariables: Record<string, string>,
-    containerPort: number
+    containerPort: number,
+    deploymentId?: string
   ): Promise<string> {
     // Convert environment variables to ECS format
     const environment: KeyValuePair[] = Object.entries(environmentVariables).map(
@@ -300,14 +331,16 @@ export class ECSService {
         logDriver: 'awslogs',
         options: {
           'awslogs-group': this.logGroup,
-          'awslogs-region': process.env.AWS_REGION || 'us-east-1',
-          'awslogs-stream-prefix': serviceName,
+          'awslogs-region': process.env.AWS_REGION || 'ap-southeast-1',
+          'awslogs-create-group': 'true',
+          'awslogs-stream-prefix': deploymentId || serviceName,
         },
       },
-    };
-
-    // Log the execution role being used
+    };      // Log the execution role being used
     logger.info(`Using execution role ARN: ${this.executionRoleArn}`);
+      // Log CloudWatch configuration
+    logger.info(`Using deploymentId as log stream name: ${deploymentId || 'undefined, falling back to serviceName'}`);
+    this.logCloudWatchConfig(deploymentId, serviceName);
 
     // Check if the role exists
     if (!this.roleExists) {
@@ -797,4 +830,17 @@ export class ECSService {
       return undefined;
     }
   }
+  // Log the CloudWatch configuration being used
+  private logCloudWatchConfig(deploymentId?: string, serviceName?: string): void {    logger.info(`Using CloudWatch log group: ${this.logGroup}`);
+    logger.info(`Using CloudWatch log stream: ${deploymentId || serviceName}`);
+    logger.info(`Using CloudWatch region: ${process.env.AWS_REGION || 'ap-southeast-1'}`);    logger.info(`Log configuration: ${JSON.stringify({
+      logDriver: 'awslogs',
+      options: {
+        'awslogs-group': this.logGroup,
+        'awslogs-region': process.env.AWS_REGION || 'ap-southeast-1',
+        'awslogs-create-group': 'true',
+        'awslogs-stream': deploymentId || serviceName
+      }
+    }, null, 2)}`);
+    }
 }

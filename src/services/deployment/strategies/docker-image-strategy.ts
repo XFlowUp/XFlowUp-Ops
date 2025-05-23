@@ -9,12 +9,11 @@ export class DockerImageStrategy implements DeploymentStrategy {
   constructor() {
     this.ecsService = new ECSService();
   }
-
-  async deploy(payload: DeploymentRequestPayload): Promise<boolean> {
+  async deploy(payload: DeploymentRequestPayload, deploymentId?: string): Promise<boolean> {
     const context = {
       serviceId: payload.serviceId,
       projectSlug: payload.projectSlug,
-      deploymentId: payload.messageId || payload.deploymentId || undefined,
+      deploymentId: deploymentId || payload.messageId || payload.deploymentId || undefined,
       type: payload.type
     };
     logger.info(`[context] Starting Docker image deployment`, context);
@@ -48,7 +47,10 @@ export class DockerImageStrategy implements DeploymentStrategy {
         serviceName,
         imageUri,
         environmentVariables,
-        containerPort
+        containerPort,
+        undefined, // customDomain
+        undefined, // healthCheckPath
+        deploymentId
       );
       logger.info(`[context] ECS deployment result: ${JSON.stringify(ecsResult)}`, context);
       // TODO: metrics: increment ecs_deploy_success if ecsResult.healthy

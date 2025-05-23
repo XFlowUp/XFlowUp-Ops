@@ -174,13 +174,17 @@ export class DeploymentManager {
 
           // Verify the site is live
           if (assignedUrl) {
-            // Do not append port to the URL, always use http://assignedUrl
-            const urlToCheck = `http://${assignedUrl}`;
+            // Determine the health check path from the payload, defaulting to '/'
+            const healthCheckPathFromPayload = payload.healthCheckPath || '/';
+            // Ensure the healthCheckPath starts with a '/'
+            const fullHealthCheckPath = healthCheckPathFromPayload.startsWith('/') ? healthCheckPathFromPayload : `/${healthCheckPathFromPayload}`;
+
+            const urlToCheck = `http://${assignedUrl}${fullHealthCheckPath}`;
             logger.info(`[CloudFlare DNS] Verifying site accessibility at: ${urlToCheck}`);
             await streamLog(`[CloudFlare DNS] Verifying site accessibility at: ${urlToCheck}`);
             // Add retry logic for health check
-            const maxHealthRetries = 10;
-            const healthRetryDelay = 10000; // 5 seconds
+            const maxHealthRetries = 20;
+            const healthRetryDelay = 15000; // 5 seconds
             for (let attempt = 1; attempt <= maxHealthRetries; attempt++) {
               try {
                 logger.info(`[CloudFlare DNS] Health check attempt ${attempt}: Sending GET request to ${urlToCheck} with 10s timeout`);

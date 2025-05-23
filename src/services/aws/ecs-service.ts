@@ -183,7 +183,7 @@ export class ECSService {
 
             if (deleted) {
               logger.info(`Creating new service after force deletion: ${serviceName}`);
-              publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port);
+              publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath);
             } else {
               logger.error(`Failed to delete service ${serviceName} for force recreation.`);
               return { serviceName, healthy: false, healthError: 'Failed to delete service for force recreation.', publicEndpoint: undefined };
@@ -191,7 +191,7 @@ export class ECSService {
           } else if (serviceStatus.isActive) {
             // Update existing active service
             logger.info(`Updating existing active service: ${serviceName}`);
-            publicEndpoint = await this.updateService(serviceName, taskDefinitionArn, port);
+            publicEndpoint = await this.updateService(serviceName, taskDefinitionArn, port, healthCheckPath);
           } else {
             // Service exists but is not active - delete and recreate
             logger.info(`Service ${serviceName} exists but is not in ACTIVE state. Deleting and recreating...`);
@@ -202,7 +202,7 @@ export class ECSService {
 
             if (deleted) {
               logger.info(`Creating new service after non-active deletion: ${serviceName}`);
-              publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port);
+              publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath);
             } else {
               logger.error(`Failed to delete non-active service ${serviceName} for recreation.`);
               return { serviceName, healthy: false, healthError: 'Failed to delete non-active service for recreation.', publicEndpoint: undefined };
@@ -211,7 +211,7 @@ export class ECSService {
         } else {
           // Create new service
           logger.info(`Creating new service: ${serviceName}`);
-          publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port);
+          publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath);
         }
 
         logger.info(`Successfully deployed ECS service: ${serviceName}`);
@@ -384,20 +384,36 @@ export class ECSService {
     try {
       logger.info(`Attempting to delete service: ${serviceName}`);
 
-      // First, update the service to have 0 desired count
-      await this.ecs.send(
-        new UpdateServiceCommand({
+      // Check current service status
+      const serviceStatusResponse = await this.ecs.send(
+        new DescribeServicesCommand({
           cluster: this.cluster,
-          service: serviceName,
-          desiredCount: 0,
+          services: [serviceName],
         })
       );
 
-      logger.info(`Updated service ${serviceName} to 0 desired count`);
+      const currentService = serviceStatusResponse.services?.[0];
 
-      // Wait for the service to scale down
-      logger.info(`Waiting for service ${serviceName} to scale down...`);
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      if (currentService && currentService.status === 'ACTIVE') {
+        // Only update desired count if the service is ACTIVE
+        logger.info(`Service ${serviceName} is ACTIVE. Setting desired count to 0.`);
+        await this.ecs.send(
+          new UpdateServiceCommand({
+            cluster: this.cluster,
+            service: serviceName,
+            desiredCount: 0,
+          })
+        );
+        logger.info(`Updated service ${serviceName} to 0 desired count`);
+
+        // Wait for the service to scale down
+        logger.info(`Waiting for service ${serviceName} to scale down...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      } else if (currentService) {
+        logger.info(`Service ${serviceName} is already in ${currentService.status} state. Skipping update to desired count.`);
+      } else {
+        logger.info(`Service ${serviceName} not found or in an unexpected state. Proceeding with deletion attempt.`);
+      }
 
       // Now delete the service
       await this.ecs.send(
@@ -467,7 +483,8 @@ export class ECSService {
   private async createService(
     serviceName: string,
     taskDefinitionArn: string,
-    containerPort: number
+    containerPort: number,
+    healthCheckPath?: string // Added healthCheckPath parameter
   ): Promise<string> { // Return ALB DNS
     try {
       logger.info(`Creating new ECS service: ${serviceName} with task definition: ${taskDefinitionArn}`);
@@ -486,7 +503,7 @@ export class ECSService {
         VpcId: this.vpcId,
         TargetType: 'ip',
         HealthCheckProtocol: 'HTTP',
-        HealthCheckPath: '/',
+        HealthCheckPath: healthCheckPath || '/', // Use provided healthCheckPath or default to '/'
       });
       tgArn = createTgRes.TargetGroups![0].TargetGroupArn!;
       logger.info(`Created new Target Group: ${tgName}`);
@@ -564,7 +581,8 @@ export class ECSService {
   private async updateService(
     serviceName: string,
     taskDefinitionArn: string,
-    containerPort: number
+    containerPort: number,
+    healthCheckPath?: string // Added healthCheckPath parameter
   ): Promise<string> { // Changed return type from Promise<void> to Promise<string>
     try {
       logger.info(`Updating existing ECS service: ${serviceName} with task definition: ${taskDefinitionArn}`);
@@ -582,7 +600,7 @@ export class ECSService {
         VpcId: this.vpcId,
         TargetType: 'ip',
         HealthCheckProtocol: 'HTTP',
-        HealthCheckPath: '/',
+        HealthCheckPath: healthCheckPath || '/', // Use provided healthCheckPath or default to '/'
       });
       tgArn = createTgRes.TargetGroups![0].TargetGroupArn!;
       logger.info(`Created new Target Group: ${tgName}`);

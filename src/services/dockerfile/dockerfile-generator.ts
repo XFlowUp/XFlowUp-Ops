@@ -252,7 +252,7 @@ NEXT_TELEMETRY_DISABLED=1`;
     }
 
     // Generate the Dockerfile
-    let dockerfile = `FROM node:18-alpine\n\nWORKDIR /app\n`;
+    let dockerfile = `FROM node:22-alpine\n\nWORKDIR /app\n`;
 
     // For Prisma projects, we need to copy the prisma directory first
     if (hasPrisma) {

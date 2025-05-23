@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch-logs": "^3.515.0",
+    "@aws-sdk/client-ec2": "^3.816.0",
     "@aws-sdk/client-ecr": "^3.515.0",
     "@aws-sdk/client-ecs": "^3.515.0",
     "@aws-sdk/client-elastic-load-balancing-v2": "^3.787.0",

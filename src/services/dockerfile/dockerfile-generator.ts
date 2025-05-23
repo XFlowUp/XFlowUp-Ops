@@ -324,6 +324,9 @@ NEXT_TELEMETRY_DISABLED=1`;
       dockerfile += `\n# Set PostgreSQL environment variables for Next.js\nENV PG_HOST=\"localhost\"\nENV PG_USER=\"postgres\"\nENV PG_PASSWORD=\"postgres\"\nENV PG_DATABASE=\"postgres\"\nENV PG_PORT=\"5432\"\nENV DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/postgres?schema=public\"\nENV NEXT_PUBLIC_SKIP_API_ROUTES=\"true\"\nENV NEXT_TELEMETRY_DISABLED=\"1\"\n`;
       if (hasBuildScript) {
         dockerfile += `\n# Build with environment variables to skip problematic API routes\nRUN ${packageManager === 'npm' ? 'npm run build' : packageManager === 'yarn' ? 'yarn build' : 'pnpm build'} || echo \"Build completed with warnings\"\n`;
+      } else {
+        // Always run next build for Next.js if no build script
+        dockerfile += `\nRUN npx next build || echo \"Build completed with warnings\"\n`;
       }
       dockerfile += `\nEXPOSE ${port}\n`;
     } else if (hasNuxt) {

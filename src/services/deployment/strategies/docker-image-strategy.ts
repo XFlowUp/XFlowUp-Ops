@@ -10,6 +10,7 @@ export class DockerImageStrategy implements DeploymentStrategy {
     this.ecsService = new ECSService();
   }
   async deploy(payload: DeploymentRequestPayload, deploymentId?: string, streamLog?: (msg: string) => Promise<void>): Promise<boolean> {
+    // Note: This strategy is for app containers, not databases. Public endpoint may be ALB DNS or public IP.
     const context = {
       serviceId: payload.serviceId,
       projectSlug: payload.projectSlug,

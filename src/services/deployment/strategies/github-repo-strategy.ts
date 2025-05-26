@@ -114,6 +114,7 @@ export class GithubRepoStrategy implements DeploymentStrategy {
           containerPort = Number(environmentVariables.PORT);
         }
         
+        // Note: This strategy is for app containers, not databases. Public endpoint may be ALB DNS or public IP.
         logger.info(`[context] Deploying to ECS: ${serviceName} on port ${containerPort}`, context);
         if (streamLog) await streamLog(`[context] Deploying to ECS: ${serviceName} on port ${containerPort}`);
         // TODO: metrics: increment ecs_deploy_started        // Ensure we have a valid deploymentId

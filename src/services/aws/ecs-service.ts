@@ -141,10 +141,15 @@ export class ECSService {
    * @param serviceName
    * @param imageUri
    * @param environmentVariables
-   * @param containerPort
+   * @param containerPort (internal port in container)
    * @param customDomain (optional) - full domain to link, e.g. app.example.com
    * @param healthCheckPath (optional) - health check path
-   */  async deployService(
+   * @param deploymentId (optional)
+   * @param streamLog (optional)
+   * @param hostPort (optional) - external port to map to containerPort (for DB)
+   * @param noLoadBalancer (optional) - if true, skip ALB/Target Group/Listener creation and use ECS public IP
+   */
+  async deployService(
     serviceName: string,
     imageUri: string,
     environmentVariables: Record<string, string> = {},
@@ -152,7 +157,9 @@ export class ECSService {
     customDomain?: string,
     healthCheckPath?: string, // Optional health check path
     deploymentId?: string, // Added deploymentId parameter
-    streamLog?: (msg: string) => Promise<void>
+    streamLog?: (msg: string) => Promise<void>,
+    hostPort?: number, // <-- new param, optional
+    noLoadBalancer?: boolean // <-- new param
   ): Promise<{ serviceName: string; publicEndpoint?: string; healthy: boolean; healthError?: string; customDomainUrl?: string; logStreamName?: string }> {
     let publicEndpoint: string | undefined;
     let logStreamName: string | undefined;
@@ -160,14 +167,16 @@ export class ECSService {
       logger.info(`Deploying ECS service: ${serviceName} with image: ${imageUri}`);
       if (streamLog) await streamLog(`Deploying ECS service: ${serviceName} with image: ${imageUri}`);
       const port = containerPort || 3000;
-      logger.info(`Registering task definition for service: ${serviceName}`);
-      if (streamLog) await streamLog(`Registering task definition for service: ${serviceName}`);
+      const externalPort = hostPort || port;
+      logger.info(`Registering task definition for service: ${serviceName} (hostPort: ${externalPort}, containerPort: ${port})`);
+      if (streamLog) await streamLog(`Registering task definition for service: ${serviceName} (hostPort: ${externalPort}, containerPort: ${port})`);
       const taskDefinitionArn = await this.registerTaskDefinition(
         serviceName,
         imageUri,
         environmentVariables,
         port,
-        deploymentId
+        deploymentId,
+        externalPort // <-- pass hostPort
       );
       logger.info(`Task definition registered with ARN: ${taskDefinitionArn}`);
       if (streamLog) await streamLog(`Task definition registered with ARN: ${taskDefinitionArn}`);
@@ -180,52 +189,41 @@ export class ECSService {
 
         if (serviceStatus.exists) {
           if (this.forceRecreateService) {
-            // Force recreate the service regardless of its state
             logger.info(`Force recreate option is enabled. Deleting and recreating service: ${serviceName}`);
             if (streamLog) await streamLog(`Force recreate option is enabled. Deleting and recreating service: ${serviceName}`);
             const deleted = await this.deleteService(serviceName);
-
-            // Wait a moment after deletion
             await new Promise(resolve => setTimeout(resolve, 5000));
-
             if (deleted) {
               logger.info(`Creating new service after force deletion: ${serviceName}`);
               if (streamLog) await streamLog(`Creating new service after force deletion: ${serviceName}`);
-              publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath);
+              publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath, noLoadBalancer);
             } else {
               logger.error(`Failed to delete service ${serviceName} for force recreation.`);
               return { serviceName, healthy: false, healthError: 'Failed to delete service for force recreation.', publicEndpoint: undefined };
             }
           } else if (serviceStatus.isActive) {
-            // Update existing active service
             logger.info(`Updating existing active service: ${serviceName}`);
             if (streamLog) await streamLog(`Updating existing active service: ${serviceName}`);
-            publicEndpoint = await this.updateService(serviceName, taskDefinitionArn, port, healthCheckPath);
+            publicEndpoint = await this.updateService(serviceName, taskDefinitionArn, port, healthCheckPath, noLoadBalancer);
           } else {
-            // Service exists but is not active - delete and recreate
             logger.info(`Service ${serviceName} exists but is not in ACTIVE state. Deleting and recreating...`);
             if (streamLog) await streamLog(`Service ${serviceName} exists but is not in ACTIVE state. Deleting and recreating...`);
             const deleted = await this.deleteService(serviceName);
-
-            // Wait a moment after deletion
             await new Promise(resolve => setTimeout(resolve, 5000));
-
             if (deleted) {
               logger.info(`Creating new service after non-active deletion: ${serviceName}`);
               if (streamLog) await streamLog(`Creating new service after non-active deletion: ${serviceName}`);
-              publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath);
+              publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath, noLoadBalancer);
             } else {
               logger.error(`Failed to delete non-active service ${serviceName} for recreation.`);
               return { serviceName, healthy: false, healthError: 'Failed to delete non-active service for recreation.', publicEndpoint: undefined };
             }
           }
         } else {
-          // Create new service
           logger.info(`Creating new service: ${serviceName}`);
           if (streamLog) await streamLog(`Creating new service: ${serviceName}`);
-          publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath);
+          publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath, noLoadBalancer);
         }
-
         logger.info(`Successfully deployed ECS service: ${serviceName}`);
         if (streamLog) await streamLog(`Successfully deployed ECS service: ${serviceName}`);
       } catch (error: any) {
@@ -246,11 +244,9 @@ export class ECSService {
           return { serviceName, healthy: false, healthError: `Failed to deploy to ECS: ${error.message}`, publicEndpoint: undefined };
         }
       }
-
-      // publicEndpoint should have been set by createService or updateService call.
       if (!publicEndpoint) {
-        logger.error(`ALB DNS (publicEndpoint) was not set after service create/update for ${serviceName}. This indicates an issue in the deployment flow.`);
-        return { serviceName, healthy: false, healthError: 'Failed to obtain ALB DNS during deployment.', publicEndpoint: undefined };
+        logger.error(`Public endpoint was not set after service create/update for ${serviceName}. This indicates an issue in the deployment flow.`);
+        return { serviceName, healthy: false, healthError: 'Failed to obtain public endpoint during deployment.', publicEndpoint: undefined };
       }
       // Health check logic
       const { healthy, healthError } = await this.waitForServiceHealthy(serviceName, publicEndpoint, healthCheckPath);
@@ -267,9 +263,8 @@ export class ECSService {
       } catch (err) {
         logger.warn(`Could not fetch ECS task ID for log stream name: ${err}`);
       }
-      // Link custom domain if provided and public endpoint is available
       let customDomainUrl: string | undefined = undefined;
-      if (customDomain && publicEndpoint) {
+      if (customDomain && publicEndpoint && !noLoadBalancer) {
         logger.info(`Linking custom domain ${customDomain} to ECS service ${serviceName}`);
         const dnsResult = await this.linkCustomDomain(customDomain, publicEndpoint);
         if (dnsResult) {
@@ -306,12 +301,57 @@ export class ECSService {
     return undefined;
   }
 
+  // Helper to get the public IP of the running ECS task
+  private async getTaskPublicIp(serviceName: string): Promise<string | undefined> {
+    const maxAttempts = 12; // 12 x 5s = 60s
+    const delayMs = 5000;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const listTasksRes = await this.ecs.send(new ListTasksCommand({
+          cluster: this.cluster,
+          serviceName,
+          desiredStatus: 'RUNNING',
+          maxResults: 1
+        }));
+        if (listTasksRes.taskArns && listTasksRes.taskArns.length > 0) {
+          const taskArn = listTasksRes.taskArns[0];
+          const describeTasksRes = await this.ecs.send(new DescribeTasksCommand({
+            cluster: this.cluster,
+            tasks: [taskArn],
+          }));
+          const task = describeTasksRes.tasks?.[0];
+          const eniAttachment = task?.attachments?.find(att => att.type === 'ElasticNetworkInterface');
+          const eniId = eniAttachment?.details?.find(d => d.name === 'networkInterfaceId')?.value;
+          if (eniId) {
+            const eniRes = await this.ec2.send(new DescribeNetworkInterfacesCommand({
+              NetworkInterfaceIds: [eniId],
+            }));
+            const publicIp = eniRes.NetworkInterfaces?.[0]?.Association?.PublicIp;
+            if (publicIp) {
+              logger.info(`Fetched ECS task public IP (attempt ${attempt}): ${publicIp}`);
+              return publicIp;
+            }
+          }
+        }
+        logger.info(`ECS task public IP not available yet (attempt ${attempt}/${maxAttempts}) for service ${serviceName}`);
+      } catch (err) {
+        logger.warn(`Could not fetch ECS task public IP (attempt ${attempt}): ${err}`);
+      }
+      if (attempt < maxAttempts) {
+        await new Promise(res => setTimeout(res, delayMs));
+      }
+    }
+    logger.error(`Timed out waiting for ECS task public IP for service ${serviceName}`);
+    return undefined;
+  }
+
   private async registerTaskDefinition(
     serviceName: string,
     imageUri: string,
     environmentVariables: Record<string, string>,
     containerPort: number,
-    deploymentId?: string
+    deploymentId?: string,
+    hostPort?: number // <-- new param
   ): Promise<string> {
     // Convert environment variables to ECS format
     const environment: KeyValuePair[] = Object.entries(environmentVariables).map(
@@ -330,7 +370,7 @@ export class ECSService {
       portMappings: [
         {
           containerPort,
-          hostPort: containerPort,
+          hostPort: typeof hostPort === 'number' ? hostPort : containerPort,
           protocol: 'tcp',
         },
       ],
@@ -524,9 +564,36 @@ export class ECSService {
     serviceName: string,
     taskDefinitionArn: string,
     containerPort: number,
-    healthCheckPath?: string // Added healthCheckPath parameter
+    healthCheckPath?: string, // Added healthCheckPath parameter
+    noLoadBalancer?: boolean // <-- new param
   ): Promise<string> { // Return ALB DNS
     try {
+      if (noLoadBalancer) {
+        // Create ECS service with public IP, no ALB/TargetGroup/Listener
+        logger.info(`Creating ECS service WITHOUT load balancer for DB: ${serviceName}`);
+        const networkConfig: any = {
+          awsvpcConfiguration: {
+            assignPublicIp: 'ENABLED',
+          },
+        };
+        if (this.subnetIds.length > 0) networkConfig.awsvpcConfiguration.subnets = this.subnetIds;
+        if (this.securityGroupId) networkConfig.awsvpcConfiguration.securityGroups = [this.securityGroupId];
+        await this.ecs.send(
+          new CreateServiceCommand({
+            cluster: this.cluster,
+            serviceName,
+            taskDefinition: taskDefinitionArn,
+            desiredCount: 1,
+            launchType: 'FARGATE',
+            networkConfiguration: networkConfig,
+          })
+        );
+        logger.info(`Service created successfully (no ALB): ${serviceName}`);
+        // Wait for the task to start and fetch its public IP
+        const publicIp = await this.getTaskPublicIp(serviceName);
+        logger.info(`Fetched ECS task public IP: ${publicIp}`);
+        return publicIp || '';
+      }
       logger.info(`Creating new ECS service: ${serviceName} with task definition: ${taskDefinitionArn}`);
       if (this.subnetIds.length > 0) logger.info(`Using subnets: ${this.subnetIds.join(', ')}`);
       if (this.securityGroupId) logger.info(`Using security group: ${this.securityGroupId}`);
@@ -618,12 +685,39 @@ export class ECSService {
     }
   }
 
+  // Overload updateService to support noLoadBalancer
   private async updateService(
     serviceName: string,
     taskDefinitionArn: string,
     containerPort: number,
-    healthCheckPath?: string // Added healthCheckPath parameter
-  ): Promise<string> { // Changed return type from Promise<void> to Promise<string>
+    healthCheckPath?: string,
+    noLoadBalancer?: boolean
+  ): Promise<string> {
+    if (noLoadBalancer) {
+      logger.info(`Updating ECS service WITHOUT load balancer for DB: ${serviceName}`);
+      const networkConfig: any = {
+        awsvpcConfiguration: {
+          assignPublicIp: 'ENABLED',
+        },
+      };
+      if (this.subnetIds.length > 0) networkConfig.awsvpcConfiguration.subnets = this.subnetIds;
+      if (this.securityGroupId) networkConfig.awsvpcConfiguration.securityGroups = [this.securityGroupId];
+      await this.ecs.send(
+        new UpdateServiceCommand({
+          cluster: this.cluster,
+          service: serviceName,
+          taskDefinition: taskDefinitionArn,
+          desiredCount: 1,
+          forceNewDeployment: true,
+          networkConfiguration: networkConfig,
+        })
+      );
+      logger.info(`Service updated successfully (no ALB): ${serviceName}`);
+      // Wait for the task to start and fetch its public IP
+      const publicIp = await this.getTaskPublicIp(serviceName);
+      logger.info(`Fetched ECS task public IP: ${publicIp}`);
+      return publicIp || '';
+    }
     try {
       logger.info(`Updating existing ECS service: ${serviceName} with task definition: ${taskDefinitionArn}`);
       if (this.subnetIds.length > 0) logger.info(`Using subnets: ${this.subnetIds.join(', ')}`);

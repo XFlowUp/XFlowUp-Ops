@@ -1,6 +1,7 @@
 import logger from '../../utils/logger';
 import { GithubRepoStrategy } from './strategies/github-repo-strategy';
 import { DockerImageStrategy } from './strategies/docker-image-strategy';
+import { DatabaseStrategy } from './strategies/database-strategy';
 import { SQSProducer } from '../sqs/sqs-producer';
 import { CloudflareDNS } from '../../utils/cloudflare-dns';
 import axios from 'axios';
@@ -33,7 +34,9 @@ export interface DeploymentRequestPayload {
   metadata?: {
     environmentId: string;
     environmentValues: Record<string, string>;
+    databaseType?: string; // <-- allow databaseType in metadata
   };
+  databaseType?: string; // allow top-level databaseType as well
   [key: string]: any; // Allow additional properties based on deployment type
 }
 
@@ -55,6 +58,7 @@ export class DeploymentManager {
     // Register strategies
     this.strategies.set(ServiceType.GITHUB_REPO, new GithubRepoStrategy());
     this.strategies.set(ServiceType.DOCKER_IMAGE, new DockerImageStrategy());
+    this.strategies.set(ServiceType.DATABASE, new DatabaseStrategy());
     // Add more strategies as needed
   }
   async handleDeploymentRequest(payload: DeploymentRequestPayload): Promise<void> {
@@ -128,6 +132,32 @@ export class DeploymentManager {
       }
       await streamLog(`Strategy.deploy returned: ${success}`);
       let publicEndpoint: string | undefined;
+      let assignedUrl: string | undefined;
+      let isAccessible = false;
+      let status: DeploymentStatus = DeploymentStatus.FAILED;
+      let errorMsg: any = undefined;
+
+      // Special handling for DATABASE deployments: skip DNS/public endpoint logic
+      if (payload.type === ServiceType.DATABASE) {
+        if (success) {
+          status = DeploymentStatus.COMPLETED;
+          logger.info(`[CloudFlare DNS] Database deployment successful, skipping DNS/public endpoint logic for service ID: ${payload.serviceId}`);
+          await streamLog(`[CloudFlare DNS] Database deployment successful, skipping DNS/public endpoint logic for service ID: ${payload.serviceId}`);
+        } else {
+          status = DeploymentStatus.FAILED;
+          logger.error(`[CloudFlare DNS] Database deployment failed for service ID: ${payload.serviceId}`);
+          await streamLog(`[CloudFlare DNS] Database deployment failed for service ID: ${payload.serviceId}`);
+        }
+        if (process.env.SKIP_DEPLOYMENT_STATUS_SQS !== 'true') {
+          logger.info(`[CloudFlare DNS] Sending final status update (${status}) for service ID: ${payload.serviceId}`);
+          await streamLog(`[CloudFlare DNS] Sending final status update (${status}) for service ID: ${payload.serviceId}`);
+          await this.updateDeploymentStatus({ ...payload, deploymentUrl: assignedUrl, isAccessible, logStreamName }, status, errorMsg);
+          logger.info(`[CloudFlare DNS] Successfully sent final status update (${status}) for service ID: ${payload.serviceId}`);
+          await streamLog(`[CloudFlare DNS] Successfully sent final status update (${status}) for service ID: ${payload.serviceId}`);
+        }
+        return;
+      }
+
       // --- BEGIN: Add retries for fetching public endpoint ---
       if (payload.type === ServiceType.GITHUB_REPO && typeof (strategy as any).getPublicEndpoint === 'function') {
         logger.info(`[CloudFlare DNS] Attempting to get public endpoint for service ID: ${payload.serviceId}`);
@@ -155,10 +185,6 @@ export class DeploymentManager {
         logger.warn(`[CloudFlare DNS] Service type ${payload.type} does not support public endpoints or getPublicEndpoint function is not available. This will prevent CloudFlare DNS linking.`);
       }
       // --- END: Add retries for fetching public endpoint ---
-      let assignedUrl: string | undefined;
-      let isAccessible = false;
-      let status: DeploymentStatus = DeploymentStatus.FAILED;
-      let errorMsg: any = undefined;
       if (success && publicEndpoint) {
         // Assign random subdomain via Cloudflare
         const domain = process.env.DOMAIN || 'your-domain.com';
@@ -359,6 +385,22 @@ export class DeploymentManager {
       return;
     }
     try {
+      // Determine if this is a database deployment
+      const isDatabase = payload.type === ServiceType.DATABASE;
+      // If database, try to get the connection string from the strategy
+      let databaseConnectionString: string | undefined = undefined;
+      if (isDatabase) {
+        // Try to get the connection string from the strategy instance
+        const dbStrategy = this.strategies.get(ServiceType.DATABASE) as any;
+        if (dbStrategy && typeof dbStrategy.getPublicEndpoint === 'function') {
+          databaseConnectionString = dbStrategy.getPublicEndpoint();
+        }
+      }
+      // If not database, try to get the logStreamName
+      let logStreamName: string | undefined = undefined;
+      if (!isDatabase) {
+        logStreamName = (payload as any).logStreamName;
+      }
       // Create the status update message
       const statusUpdateMessage = {
         serviceId: payload.serviceId,
@@ -366,24 +408,22 @@ export class DeploymentManager {
         status,
         error: error ? error.toString() : undefined,
         timestamp: new Date().toISOString(),
-        // Include deploymentUrl and accessibility status if available
         deploymentUrl: (payload as any).deploymentUrl,
         isAccessible: (payload as any).isAccessible || false,
         // Include the original message for reference
-        originalMessage: payload
+        originalMessage: payload,
+        // Add logStreamName for frontend/backend, or databaseConnectionString for DB
+        ...(logStreamName ? { logStreamName } : {}),
+        ...(databaseConnectionString ? { databaseConnectionString } : {}),
       };
 
-      // Log the status update message
       logger.info(`Sending status update message: ${JSON.stringify(statusUpdateMessage)}`);
-
-      // Send status update message to SQS
       const messageId = await this.sqsProducer.sendMessage(
         statusUpdateMessage,
         'deployment:status-update',
         `deployment-${payload.serviceId}`,
         this.statusQueueUrl // Use the status queue URL
       );
-
       logger.info(`Updated deployment status to ${status} for service ID: ${payload.serviceId}`);
       logger.info(`Status update message sent with ID: ${messageId}`);
     } catch (error) {

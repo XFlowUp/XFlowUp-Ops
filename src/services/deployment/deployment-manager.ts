@@ -39,7 +39,7 @@ export interface DeploymentRequestPayload {
 
 // Define the deployment strategy interface
 export interface DeploymentStrategy {
-  deploy(payload: DeploymentRequestPayload): Promise<boolean>;
+  deploy(payload: DeploymentRequestPayload, deploymentId?: string, streamLog?: (msg: string) => Promise<void>): Promise<boolean>;
 }
 
 export class DeploymentManager {
@@ -58,12 +58,12 @@ export class DeploymentManager {
     // Add more strategies as needed
   }
   async handleDeploymentRequest(payload: DeploymentRequestPayload): Promise<void> {
-    logger.info(`Handling deployment request for service type: ${payload.type}`);    // --- BEGIN: CloudWatch log streaming setup ---
-    const deploymentId = (payload as any).deploymentId || `fallback-${payload.serviceId}-${Date.now()}`;
+    logger.info(`Handling deployment request for service type: ${payload.type}`);    const deploymentId = (payload as any).deploymentId || `fallback-${payload.serviceId}-${Date.now()}`;
     const logGroupName = '/ecs/log-builder';
     const logStreamName = deploymentId;
     this.cloudWatchLogger = new CloudWatchStreamLogger(logGroupName, logStreamName);
-    await this.cloudWatchLogger.init();const streamLog = async (msg: string) => {
+    await this.cloudWatchLogger.init();
+    const streamLog = async (msg: string) => {
       logger.info(`[STREAM_LOG] ${msg}`);
       await this.cloudWatchLogger?.putLog(msg);
     };
@@ -108,7 +108,7 @@ export class DeploymentManager {
       }
 
       // Execute the deployment
-      const deployResult = await strategy.deploy(payload);
+      const deployResult = await strategy.deploy(payload, deploymentId, streamLog);
       let success: boolean = false;
       let logStreamName: string | undefined;
       // Type guard for deployResult

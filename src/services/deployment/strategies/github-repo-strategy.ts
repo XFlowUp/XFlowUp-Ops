@@ -21,7 +21,7 @@ export class GithubRepoStrategy implements DeploymentStrategy {
     this.dockerfileGenerator = new DockerfileGenerator();
   }
 
-  async deploy(payload: DeploymentRequestPayload, deploymentId?: string): Promise<boolean> {
+  async deploy(payload: DeploymentRequestPayload, deploymentId?: string, streamLog?: (msg: string) => Promise<void>): Promise<boolean> {
     const context = {
       serviceId: payload.serviceId,
       projectSlug: payload.projectSlug,
@@ -29,6 +29,7 @@ export class GithubRepoStrategy implements DeploymentStrategy {
       type: payload.type
     };
     logger.info(`[context] Starting GitHub repo deployment`, context);
+    if (streamLog) await streamLog(`[context] Starting GitHub repo deployment: ${JSON.stringify(context)}`);
     // TODO: metrics: increment github_deploy_started
 
     if (!payload.githubRepository) {
@@ -91,10 +92,12 @@ export class GithubRepoStrategy implements DeploymentStrategy {
       // Build and push Docker image
       const imageTag = `${payload.projectSlug}-${payload.serviceId}-${Date.now()}`;
       logger.info(`[context] Building and pushing Docker image: ${imageTag}`, context);
+      if (streamLog) await streamLog(`[context] Building and pushing Docker image: ${imageTag}`);
       // TODO: metrics: increment docker_build_started
       try {
-        const imageUri = await this.ecrService.buildAndPushImage(repoDir, imageTag);
+        const imageUri = await this.ecrService.buildAndPushImage(repoDir, imageTag, streamLog);
         logger.info(`[context] Docker image built and pushed: ${imageUri}`, context);
+        if (streamLog) await streamLog(`[context] Docker image built and pushed: ${imageUri}`);
         // TODO: metrics: increment docker_build_success
         
         // Create or update ECS service
@@ -112,6 +115,7 @@ export class GithubRepoStrategy implements DeploymentStrategy {
         }
         
         logger.info(`[context] Deploying to ECS: ${serviceName} on port ${containerPort}`, context);
+        if (streamLog) await streamLog(`[context] Deploying to ECS: ${serviceName} on port ${containerPort}`);
         // TODO: metrics: increment ecs_deploy_started        // Ensure we have a valid deploymentId
         const effectiveDeploymentId = payload.deploymentId || context.deploymentId || `manual-deploy-${Date.now()}`;
         logger.info(`[context] Using deployment ID for CloudWatch logs: ${effectiveDeploymentId}`, context);
@@ -123,10 +127,11 @@ export class GithubRepoStrategy implements DeploymentStrategy {
           containerPort,
           undefined, // customDomain
           undefined, // healthCheckPath
-          effectiveDeploymentId
+          effectiveDeploymentId,
+          streamLog
         );
-        
         logger.info(`[context] ECS deployment result: ${JSON.stringify(ecsResult)}`, context);
+        if (streamLog) await streamLog(`[context] ECS deployment result: ${JSON.stringify(ecsResult)}`);
         // TODO: metrics: increment ecs_deploy_success if ecsResult.healthy
         this.lastPublicEndpoint = ecsResult.publicEndpoint;
         return ecsResult.healthy;

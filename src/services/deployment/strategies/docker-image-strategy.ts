@@ -9,7 +9,7 @@ export class DockerImageStrategy implements DeploymentStrategy {
   constructor() {
     this.ecsService = new ECSService();
   }
-  async deploy(payload: DeploymentRequestPayload, deploymentId?: string): Promise<boolean> {
+  async deploy(payload: DeploymentRequestPayload, deploymentId?: string, streamLog?: (msg: string) => Promise<void>): Promise<boolean> {
     const context = {
       serviceId: payload.serviceId,
       projectSlug: payload.projectSlug,
@@ -17,11 +17,13 @@ export class DockerImageStrategy implements DeploymentStrategy {
       type: payload.type
     };
     logger.info(`[context] Starting Docker image deployment`, context);
+    if (streamLog) await streamLog(`[context] Starting Docker image deployment: ${JSON.stringify(context)}`);
     // TODO: metrics: increment docker_image_deploy_started
     this.lastPublicEndpoint = undefined;
     try {
       if (!payload.docker_image_url) {
         logger.error(`[context] Docker image URL is missing`, context);
+        if (streamLog) await streamLog(`[context] Docker image URL is missing: ${JSON.stringify(context)}`);
         // TODO: metrics: increment docker_image_deploy_failed
         throw new Error('Docker image URL is missing');
       }
@@ -30,6 +32,7 @@ export class DockerImageStrategy implements DeploymentStrategy {
       const imageTag = payload.docker_image_tag || 'latest';
       const imageUri = `${imageUrl}:${imageTag}`;
       logger.info(`[context] Using image URI: ${imageUri}`, context);
+      if (streamLog) await streamLog(`[context] Using image URI: ${imageUri}`);
       // Create or update ECS service
       const serviceName = `${payload.projectSlug}-${payload.serviceId}`;
       const environmentVariables = payload.metadata?.environmentValues || {};
@@ -42,6 +45,7 @@ export class DockerImageStrategy implements DeploymentStrategy {
         containerPort = Number(environmentVariables.PORT);
       }
       logger.info(`[context] Deploying to ECS: ${serviceName} on port ${containerPort}`, context);
+      if (streamLog) await streamLog(`[context] Deploying to ECS: ${serviceName} on port ${containerPort}`);
       // TODO: metrics: increment ecs_deploy_started
       const ecsResult = await this.ecsService.deployService(
         serviceName,
@@ -50,15 +54,19 @@ export class DockerImageStrategy implements DeploymentStrategy {
         containerPort,
         undefined, // customDomain
         undefined, // healthCheckPath
-        deploymentId
+        deploymentId,
+        streamLog
       );
       logger.info(`[context] ECS deployment result: ${JSON.stringify(ecsResult)}`, context);
+      if (streamLog) await streamLog(`[context] ECS deployment result: ${JSON.stringify(ecsResult)}`);
       // TODO: metrics: increment ecs_deploy_success if ecsResult.healthy
       this.lastPublicEndpoint = ecsResult.publicEndpoint;
       logger.info(`[context] Docker image deployment completed for service ID: ${payload.serviceId}`, context);
+      if (streamLog) await streamLog(`[context] Docker image deployment completed for service ID: ${payload.serviceId}`);
       return ecsResult.healthy;
     } catch (error) {
       logger.error(`[context] Docker image deployment failed: ${error}`, context);
+      if (streamLog) await streamLog(`[context] Docker image deployment failed: ${error}`);
       this.lastPublicEndpoint = undefined;
       // TODO: metrics: increment docker_image_deploy_failed
       return false;

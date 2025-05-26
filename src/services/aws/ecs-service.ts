@@ -151,14 +151,17 @@ export class ECSService {
     containerPort?: number,
     customDomain?: string,
     healthCheckPath?: string, // Optional health check path
-    deploymentId?: string // Added deploymentId parameter
+    deploymentId?: string, // Added deploymentId parameter
+    streamLog?: (msg: string) => Promise<void>
   ): Promise<{ serviceName: string; publicEndpoint?: string; healthy: boolean; healthError?: string; customDomainUrl?: string; logStreamName?: string }> {
     let publicEndpoint: string | undefined;
     let logStreamName: string | undefined;
     try {
       logger.info(`Deploying ECS service: ${serviceName} with image: ${imageUri}`);
-      const port = containerPort || 3000;      // Register task definition outside the inner try block so it's available in the catch block
+      if (streamLog) await streamLog(`Deploying ECS service: ${serviceName} with image: ${imageUri}`);
+      const port = containerPort || 3000;
       logger.info(`Registering task definition for service: ${serviceName}`);
+      if (streamLog) await streamLog(`Registering task definition for service: ${serviceName}`);
       const taskDefinitionArn = await this.registerTaskDefinition(
         serviceName,
         imageUri,
@@ -167,16 +170,19 @@ export class ECSService {
         deploymentId
       );
       logger.info(`Task definition registered with ARN: ${taskDefinitionArn}`);
+      if (streamLog) await streamLog(`Task definition registered with ARN: ${taskDefinitionArn}`);
 
       try {
         // Check if service exists and is active
         logger.info(`Checking if service ${serviceName} exists and is active`);
+        if (streamLog) await streamLog(`Checking if service ${serviceName} exists and is active`);
         const serviceStatus = await this.checkServiceExists(serviceName);
 
         if (serviceStatus.exists) {
           if (this.forceRecreateService) {
             // Force recreate the service regardless of its state
             logger.info(`Force recreate option is enabled. Deleting and recreating service: ${serviceName}`);
+            if (streamLog) await streamLog(`Force recreate option is enabled. Deleting and recreating service: ${serviceName}`);
             const deleted = await this.deleteService(serviceName);
 
             // Wait a moment after deletion
@@ -184,6 +190,7 @@ export class ECSService {
 
             if (deleted) {
               logger.info(`Creating new service after force deletion: ${serviceName}`);
+              if (streamLog) await streamLog(`Creating new service after force deletion: ${serviceName}`);
               publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath);
             } else {
               logger.error(`Failed to delete service ${serviceName} for force recreation.`);
@@ -192,10 +199,12 @@ export class ECSService {
           } else if (serviceStatus.isActive) {
             // Update existing active service
             logger.info(`Updating existing active service: ${serviceName}`);
+            if (streamLog) await streamLog(`Updating existing active service: ${serviceName}`);
             publicEndpoint = await this.updateService(serviceName, taskDefinitionArn, port, healthCheckPath);
           } else {
             // Service exists but is not active - delete and recreate
             logger.info(`Service ${serviceName} exists but is not in ACTIVE state. Deleting and recreating...`);
+            if (streamLog) await streamLog(`Service ${serviceName} exists but is not in ACTIVE state. Deleting and recreating...`);
             const deleted = await this.deleteService(serviceName);
 
             // Wait a moment after deletion
@@ -203,6 +212,7 @@ export class ECSService {
 
             if (deleted) {
               logger.info(`Creating new service after non-active deletion: ${serviceName}`);
+              if (streamLog) await streamLog(`Creating new service after non-active deletion: ${serviceName}`);
               publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath);
             } else {
               logger.error(`Failed to delete non-active service ${serviceName} for recreation.`);
@@ -212,27 +222,24 @@ export class ECSService {
         } else {
           // Create new service
           logger.info(`Creating new service: ${serviceName}`);
+          if (streamLog) await streamLog(`Creating new service: ${serviceName}`);
           publicEndpoint = await this.createService(serviceName, taskDefinitionArn, port, healthCheckPath);
         }
 
         logger.info(`Successfully deployed ECS service: ${serviceName}`);
+        if (streamLog) await streamLog(`Successfully deployed ECS service: ${serviceName}`);
       } catch (error: any) {
         // Provide more detailed error information
         if (error.name === 'ServiceNotActiveException') {
           logger.error(`ECS deployment error: Service is not active. ${error.message}`);
-          // ... (rest of specific error handling)
           return { serviceName, healthy: false, healthError: 'ServiceNotActiveException, failed to recreate.', publicEndpoint: undefined };
         } else if (error.name === 'InvalidParameterException' && error.message.includes('still Draining')) {
-          // ... (rest of specific error handling)
           return { serviceName, healthy: false, healthError: 'Service was draining and had to be recreated.', publicEndpoint: undefined };
         } else if (error.name === 'ClientException' && error.message.includes('networkMode=awsvpc')) {
-          // ... (rest of specific error handling)
           return { serviceName, healthy: false, healthError: 'awsvpc network mode port mismatch.', publicEndpoint: undefined };
         } else if (error.name === 'InvalidParameterException' && error.message.includes('subnet')) {
-          // ... (rest of specific error handling)
           return { serviceName, healthy: false, healthError: 'Invalid subnet configuration.', publicEndpoint: undefined };
         } else if (error.name === 'InvalidParameterException' && error.message.includes('security group')) {
-          // ... (rest of specific error handling)
           return { serviceName, healthy: false, healthError: 'Invalid security group configuration.', publicEndpoint: undefined };
         } else {
           logger.error(`Failed to deploy to ECS: ${error}`);

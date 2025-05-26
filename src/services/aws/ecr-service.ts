@@ -50,14 +50,15 @@ export class ECRService {
     }
   }
 
-  async buildAndPushImage(repoDir: string, imageTag: string): Promise<string> {
+  async buildAndPushImage(repoDir: string, imageTag: string, streamLog?: (msg: string) => Promise<void>): Promise<string> {
     try {
       logger.info(`Building and pushing Docker image with tag: ${imageTag}`);
-
+      if (streamLog) await streamLog(`Building and pushing Docker image with tag: ${imageTag}`);
       // Build Docker image first (this doesn't require AWS connectivity)
       const fullImageTag = `${this.repositoryUri}:${imageTag}`;
-      await this.buildImage(repoDir, fullImageTag);
+      await this.buildImage(repoDir, fullImageTag, streamLog);
       logger.info(`Successfully built Docker image: ${fullImageTag}`);
+      if (streamLog) await streamLog(`Successfully built Docker image: ${fullImageTag}`);
 
       try {
         // Get ECR authentication token
@@ -126,17 +127,31 @@ export class ECRService {
     }
   }
 
-  private async buildImage(repoDir: string, imageTag: string): Promise<void> {
-    try {
-      const { stdout, stderr } = await execAsync(`docker build -t ${imageTag} ${repoDir}`);
-      logger.debug(`Docker build stdout: ${stdout}`);
-      if (stderr) {
-        logger.warn(`Docker build stderr: ${stderr}`);
-      }
-    } catch (error: any) {
-      logger.error(`Docker build error: ${error.message}`);
-      throw new Error(`Failed to build Docker image: ${error.message}`);
-    }
+  private async buildImage(repoDir: string, imageTag: string, streamLog?: (msg: string) => Promise<void>): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const { spawn } = require('child_process');
+      const build = spawn('docker', ['build', '-t', imageTag, repoDir]);
+      build.stdout.on('data', (data: Buffer) => {
+        const msg = data.toString();
+        logger.debug(`Docker build stdout: ${msg}`);
+        if (streamLog) streamLog(`[docker-build] ${msg}`);
+      });
+      build.stderr.on('data', (data: Buffer) => {
+        const msg = data.toString();
+        logger.warn(`Docker build stderr: ${msg}`);
+        if (streamLog) streamLog(`[docker-build] ${msg}`);
+      });
+      build.on('close', (code: number) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`Docker build failed with code ${code}`));
+        }
+      });
+      build.on('error', (err: Error) => {
+        reject(err);
+      });
+    });
   }
 
   private async dockerLogin(authorizationToken: string, proxyEndpoint: string): Promise<void> {
